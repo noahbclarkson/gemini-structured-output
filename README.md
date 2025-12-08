@@ -1,0 +1,1 @@
+# gemini-structured-output
