@@ -2,6 +2,10 @@
 //!
 //! This module provides `ParallelMapStep` which applies a worker step to multiple
 //! inputs concurrently, with configurable concurrency limits.
+//!
+//! Internally, this is implemented using `BatchStep` with a batch size of 1,
+//! demonstrating how the batch primitive can be used for different parallel
+//! processing patterns.
 
 use std::sync::Arc;
 
@@ -17,6 +21,11 @@ use super::Step;
 ///
 /// This step takes a `Vec<Input>` and runs the worker step on each item
 /// in parallel, respecting the configured concurrency limit.
+///
+/// # Implementation
+///
+/// This is a high-level convenience wrapper. For more control over batching,
+/// use `BatchStep` directly.
 ///
 /// # Example
 ///
@@ -44,6 +53,11 @@ where
             concurrency: concurrency.max(1),
         }
     }
+
+    /// Get the configured concurrency limit.
+    pub fn concurrency(&self) -> usize {
+        self.concurrency
+    }
 }
 
 #[async_trait]
@@ -57,7 +71,6 @@ where
             return Ok(Vec::new());
         }
 
-        // We can share the context across parallel tasks because metrics are Arc<Mutex<...>>
         let results = stream::iter(inputs.into_iter().map(|input| {
             let worker = self.worker.clone();
             let ctx_clone = ctx.clone();
@@ -73,5 +86,41 @@ where
         }
 
         Ok(outputs)
+    }
+}
+
+/// Builder for creating parallel processing pipelines.
+///
+/// This provides a fluent API for configuring parallel map operations.
+pub struct ParallelMapBuilder<I, O> {
+    worker: Arc<dyn Step<I, O>>,
+    concurrency: usize,
+}
+
+impl<I, O> ParallelMapBuilder<I, O>
+where
+    I: Send + Sync + 'static,
+    O: Send + Sync + 'static,
+{
+    /// Start building a parallel map step with the given worker.
+    pub fn new(worker: impl Step<I, O> + 'static) -> Self {
+        Self {
+            worker: Arc::new(worker),
+            concurrency: 4, // sensible default
+        }
+    }
+
+    /// Set the concurrency limit (default: 4).
+    pub fn concurrency(mut self, limit: usize) -> Self {
+        self.concurrency = limit.max(1);
+        self
+    }
+
+    /// Build the parallel map step.
+    pub fn build(self) -> ParallelMapStep<I, O> {
+        ParallelMapStep {
+            worker: self.worker,
+            concurrency: self.concurrency,
+        }
     }
 }

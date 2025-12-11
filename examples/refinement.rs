@@ -30,7 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initial profile: {profile:#?}");
 
     let instruction = "Promote to Principal Engineer and set country to USA.";
-    let outcome = client.refine(&profile, instruction).await?;
+    let outcome = client
+        .refine(profile, instruction.to_string())
+        .execute()
+        .await?;
 
     println!("Refined profile: {:#?}", outcome.value);
     println!("Refinement attempts: {}", outcome.attempts.len());

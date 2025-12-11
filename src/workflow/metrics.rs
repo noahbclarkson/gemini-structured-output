@@ -1,12 +1,14 @@
 //! Metrics and context for workflow execution.
 //!
 //! This module provides observability primitives for tracking workflow execution,
-//! including token usage, retry attempts, and failure logging.
+//! including token usage, retry attempts, failure logging, and structured event tracing.
 
 use std::sync::{Arc, Mutex};
 
 use gemini_rust::generation::model::UsageMetadata;
+use serde::Serialize;
 
+use super::events::{TraceEntry, WorkflowEvent};
 use crate::models::GenerationOutcome;
 
 /// Aggregated metrics for a workflow execution.
@@ -59,10 +61,33 @@ impl WorkflowMetrics {
 ///
 /// This context is cloneable and thread-safe, allowing it to be shared
 /// across parallel step executions. All metric updates are synchronized.
+///
+/// # Tracing
+///
+/// The context also maintains a structured trace log of workflow events,
+/// enabling detailed observability without relying on unstructured string logs.
+///
+/// ```rust,ignore
+/// use gemini_structured_output::workflow::{ExecutionContext, WorkflowEvent};
+///
+/// let ctx = ExecutionContext::new();
+/// ctx.emit(WorkflowEvent::StepStart {
+///     step_name: "Summarize".to_string(),
+///     input_type: "String".to_string(),
+/// });
+///
+/// // Later, get all trace entries
+/// let traces = ctx.trace_snapshot();
+/// for entry in traces {
+///     println!("{:?}", entry);
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     /// Shared metrics accumulator.
     pub metrics: Arc<Mutex<WorkflowMetrics>>,
+    /// Shared trace log for structured workflow events.
+    pub traces: Arc<Mutex<Vec<TraceEntry>>>,
 }
 
 impl Default for ExecutionContext {
@@ -72,10 +97,11 @@ impl Default for ExecutionContext {
 }
 
 impl ExecutionContext {
-    /// Create a new execution context with empty metrics.
+    /// Create a new execution context with empty metrics and traces.
     pub fn new() -> Self {
         Self {
             metrics: Arc::new(Mutex::new(WorkflowMetrics::default())),
+            traces: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -102,5 +128,58 @@ impl ExecutionContext {
     pub fn snapshot(&self) -> WorkflowMetrics {
         let m = self.metrics.lock().unwrap();
         m.clone()
+    }
+
+    /// Emit a structured workflow event to the trace log.
+    ///
+    /// Events are timestamped automatically when emitted.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// ctx.emit(WorkflowEvent::StepStart {
+    ///     step_name: "Summarize".to_string(),
+    ///     input_type: "Article".to_string(),
+    /// });
+    /// ```
+    pub fn emit(&self, event: WorkflowEvent) {
+        let entry = TraceEntry::new(event);
+        self.traces.lock().unwrap().push(entry);
+    }
+
+    /// Emit an artifact event with automatic JSON serialization.
+    ///
+    /// This is a convenience method for recording intermediate outputs
+    /// from workflow steps.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let summary = Summary { text: "...".to_string(), word_count: 150 };
+    /// ctx.emit_artifact("Summarize", "output", &summary);
+    /// ```
+    pub fn emit_artifact<T: Serialize>(&self, step_name: &str, key: &str, data: &T) {
+        let json_data = serde_json::to_value(data)
+            .unwrap_or_else(|_| serde_json::json!("<serialization_error>"));
+        self.emit(WorkflowEvent::Artifact {
+            step_name: step_name.to_string(),
+            key: key.to_string(),
+            data: json_data,
+        });
+    }
+
+    /// Get a snapshot of the current trace log.
+    ///
+    /// Returns all trace entries recorded so far. Useful for debugging
+    /// or exporting execution traces.
+    pub fn trace_snapshot(&self) -> Vec<TraceEntry> {
+        self.traces.lock().unwrap().clone()
+    }
+
+    /// Clear all trace entries.
+    ///
+    /// This can be useful when reusing a context across multiple workflow runs.
+    pub fn clear_traces(&self) {
+        self.traces.lock().unwrap().clear();
     }
 }

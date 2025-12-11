@@ -42,11 +42,13 @@ pub mod error;
 #[cfg(feature = "evals")]
 pub mod evals;
 pub mod files;
+pub mod generator;
 #[cfg(feature = "helpers")]
 pub mod helpers;
 pub mod models;
 pub mod patching;
 pub mod request;
+pub mod session;
 pub mod schema;
 pub mod tools;
 pub mod workflow;
@@ -58,21 +60,27 @@ pub use client::{
     ClientConfig, FallbackStrategy, MockHandler, MockRequest, StructuredClient,
     StructuredClientBuilder,
 };
+pub use generator::{GeminiGenerator, TextGenerator};
 pub use context::ContextBuilder;
 pub use error::{Result, ResultExt, StructuredError};
 #[cfg(feature = "evals")]
 pub use evals::{EvalResult, EvalSuite, SuiteReport};
 pub use files::FileManager;
 pub use models::{GenerationOutcome, RefinementAttempt, RefinementOutcome};
-pub use patching::{ArrayPatchStrategy, PatchStrategy, RefinementConfig, RefinementEngine};
+pub use patching::{
+    ArrayPatchStrategy, AsyncCustomValidator, BoxFuture, CustomValidator, PatchStrategy,
+    RefinementConfig, RefinementEngine, RefinementRequest, ValidationFailureStrategy,
+};
 pub use request::{StreamEvent, StructuredRequest};
+pub use session::{ChangeEffect, EntryKind, InteractiveSession, PendingChange, SessionEntry};
 pub use schema::{GeminiStructured, GeminiValidator, StructuredValidator};
 pub use tools::ToolRegistry;
 pub use workflow::{
-    BoxedStepExt, ChainStep, ChainTupleStep, ConfiguredReduceStep, ExecutionContext,
-    LambdaStateStep, LambdaStep, MapStep, ParallelMapStep, ReduceStep, ReduceStepBuilder,
-    ReviewStep, RouterStep, StateStep, StateWorkflow, Step, StepAdapter, WindowedContextStep,
-    Workflow, WorkflowMetrics, WorkflowStep,
+    BatchStep, BoxedStepExt, ChainStep, ChainTupleStep, CheckpointStep, ConditionalCheckpointStep,
+    ConfiguredReduceStep, ExecutionContext, InstrumentedStep, LambdaStateStep, LambdaStep, MapStep,
+    ParallelMapBuilder, ParallelMapStep, ReduceStep, ReduceStepBuilder, ReviewStep, RouterStep,
+    SingleItemAdapter, StateStep, StateWorkflow, Step, StepAdapter, TapStep, TraceEntry,
+    WindowedContextStep, Workflow, WorkflowEvent, WorkflowMetrics, WorkflowStep,
 };
 
 /// Prelude module for convenient imports.
@@ -86,28 +94,34 @@ pub mod prelude {
     pub use crate::client::{
         FallbackStrategy, MockHandler, MockRequest, StructuredClient, StructuredClientBuilder,
     };
+    pub use crate::generator::{GeminiGenerator, TextGenerator};
     pub use crate::context::ContextBuilder;
     pub use crate::error::{Result, ResultExt, StructuredError};
     #[cfg(feature = "evals")]
     pub use crate::evals::{EvalResult, EvalSuite, SuiteReport};
     pub use crate::models::{GenerationOutcome, RefinementOutcome};
     pub use crate::patching::{
-        ArrayPatchStrategy, PatchStrategy, RefinementConfig, RefinementEngine,
+        ArrayPatchStrategy, AsyncCustomValidator, BoxFuture, CustomValidator, PatchStrategy,
+        RefinementConfig, RefinementEngine, RefinementRequest, ValidationFailureStrategy,
     };
     pub use crate::request::{StreamEvent, StructuredRequest};
+    pub use crate::session::{ChangeEffect, EntryKind, InteractiveSession, PendingChange, SessionEntry};
     pub use crate::schema::{GeminiStructured, GeminiValidator, StructuredValidator};
     pub use crate::tools::ToolRegistry;
     pub use crate::workflow::{
-        BoxedStepExt, ChainStep, ChainTupleStep, ConfiguredReduceStep, ExecutionContext,
-        LambdaStateStep, LambdaStep, MapStep, ParallelMapStep, ReduceStep, ReduceStepBuilder,
-        ReviewStep, RouterStep, StateStep, StateWorkflow, Step, StepAdapter, WindowedContextStep,
-        Workflow, WorkflowMetrics, WorkflowStep,
+        BatchStep, BoxedStepExt, ChainStep, ChainTupleStep, CheckpointStep,
+        ConditionalCheckpointStep, ConfiguredReduceStep, ExecutionContext, InstrumentedStep,
+        LambdaStateStep, LambdaStep, MapStep, ParallelMapBuilder, ParallelMapStep, ReduceStep,
+        ReduceStepBuilder, ReviewStep, RouterStep, SingleItemAdapter, StateStep, StateWorkflow,
+        Step, StepAdapter, TapStep, TraceEntry, WindowedContextStep, Workflow, WorkflowEvent,
+        WorkflowMetrics, WorkflowStep,
     };
 
     // Re-export commonly used external types
     pub use gemini_rust::Model;
     pub use schemars::JsonSchema;
     pub use serde::{Deserialize, Serialize};
+    pub use json_patch::{diff, Patch, PatchOperation};
 
     // Re-export macros when the feature is enabled
     #[cfg(feature = "macros")]
@@ -123,3 +137,4 @@ pub use helpers::{
 
 #[cfg(feature = "macros")]
 pub use gemini_structured_macros::{gemini_agent, gemini_tool, GeminiPrompt, GeminiValidated};
+pub use json_patch::{diff, Patch, PatchOperation};

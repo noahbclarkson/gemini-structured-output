@@ -29,11 +29,29 @@ impl RefinementAttempt {
 pub struct RefinementOutcome<T> {
     pub value: T,
     pub attempts: Vec<RefinementAttempt>,
+    /// Parsed JSON Patch that produced the final value, when available.
+    pub patch: Option<json_patch::Patch>,
 }
 
 impl<T> RefinementOutcome<T> {
     pub fn new(value: T, attempts: Vec<RefinementAttempt>) -> Self {
-        Self { value, attempts }
+        Self {
+            value,
+            attempts,
+            patch: None,
+        }
+    }
+
+    pub fn with_patch(
+        value: T,
+        attempts: Vec<RefinementAttempt>,
+        patch: Option<json_patch::Patch>,
+    ) -> Self {
+        Self {
+            value,
+            attempts,
+            patch,
+        }
     }
 }
 

@@ -394,7 +394,11 @@ where
                         debug!("Successfully parsed structured response");
                         if let Some(instruction) = &self.refinement_instruction {
                             debug!("Starting refinement step");
-                            let refinement = self.client.refine(&parsed, instruction).await?;
+                            let refinement = self
+                                .client
+                                .refine(parsed, instruction.clone())
+                                .execute()
+                                .await?;
                             return Ok(GenerationOutcome::new(
                                 refinement.value,
                                 response.usage_metadata,

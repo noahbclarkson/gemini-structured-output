@@ -12,8 +12,11 @@ use crate::{
     context::ContextBuilder,
     error::{Result, StructuredError},
     files::FileManager,
-    models::{GenerationOutcome, RefinementOutcome},
-    patching::{ArrayPatchStrategy, PatchStrategy, RefinementConfig, RefinementEngine},
+    models::GenerationOutcome,
+    patching::{
+        ArrayPatchStrategy, PatchStrategy, RefinementConfig, RefinementEngine, RefinementRequest,
+        ValidationFailureStrategy,
+    },
     schema::{GeminiStructured, StructuredValidator},
     tools::ToolRegistry,
     StructuredRequest,
@@ -106,6 +109,7 @@ pub struct StructuredClientBuilder {
     fallback_strategy: FallbackStrategy,
     config: ClientConfig,
     mock_handler: Option<MockHandler>,
+    refinement_engine_override: Option<RefinementEngine>,
 }
 
 impl StructuredClientBuilder {
@@ -121,6 +125,7 @@ impl StructuredClientBuilder {
             fallback_strategy: FallbackStrategy::default(),
             config: ClientConfig::default(),
             mock_handler: None,
+            refinement_engine_override: None,
         }
     }
 
@@ -231,6 +236,12 @@ impl StructuredClientBuilder {
         self
     }
 
+    /// Override the refinement engine (useful for offline tests or custom backends).
+    pub fn with_refinement_engine(mut self, engine: RefinementEngine) -> Self {
+        self.refinement_engine_override = Some(engine);
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<StructuredClient> {
         let client = Arc::new(Gemini::with_model(&self.api_key, self.model.clone())?);
@@ -250,10 +261,15 @@ impl StructuredClientBuilder {
             array_strategy: self.config.array_strategy.clone(),
             network_retries: self.refinement_network_retries,
             fallback_strategy: self.fallback_strategy.clone(),
+            validation_failure_strategy: ValidationFailureStrategy::default(),
         };
 
-        let refiner = RefinementEngine::new(client.clone(), fallback_client.clone())
-            .with_config(refiner_config);
+        let refiner = if let Some(engine) = self.refinement_engine_override {
+            engine.with_config(refiner_config)
+        } else {
+            RefinementEngine::new(client.clone(), fallback_client.clone())
+                .with_config(refiner_config)
+        };
 
         Ok(StructuredClient {
             client: client.clone(),
@@ -395,12 +411,25 @@ impl StructuredClient {
     }
 
     /// Refine an existing value using a JSON Patch feedback loop.
+    ///
+    /// Returns a builder so callers can attach documents or dynamic context before execution.
     #[instrument(skip_all, fields(target = std::any::type_name::<T>()))]
-    pub async fn refine<T>(&self, current: &T, instruction: &str) -> Result<RefinementOutcome<T>>
+    pub fn refine<'a, T>(
+        &'a self,
+        current: T,
+        instruction: impl Into<String>,
+    ) -> RefinementRequest<'a, T>
     where
-        T: GeminiStructured + StructuredValidator + Serialize + DeserializeOwned + Clone,
+        T: GeminiStructured
+            + StructuredValidator
+            + Serialize
+            + DeserializeOwned
+            + Clone
+            + Send
+            + Sync
+            + 'static,
     {
-        self.refiner.refine(current, instruction).await
+        RefinementRequest::new(self, current, instruction.into())
     }
 
     /// Access the underlying Gemini client when low-level controls are required.
@@ -416,6 +445,11 @@ impl StructuredClient {
     /// Get the fallback strategy.
     pub fn fallback_strategy(&self) -> &FallbackStrategy {
         &self.fallback_strategy
+    }
+
+    /// Access the internal refinement engine.
+    pub(crate) fn refiner(&self) -> &RefinementEngine {
+        &self.refiner
     }
 
     /// Select the appropriate client based on the fallback strategy and attempt count.

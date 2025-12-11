@@ -54,6 +54,31 @@ pub enum StructuredError {
 
     #[error("Service unavailable: {message}. Attempted {attempts} retries.")]
     ServiceUnavailable { message: String, attempts: usize },
+
+    /// Workflow checkpoint triggered for human-in-the-loop processing.
+    ///
+    /// This error is intentionally raised by `CheckpointStep` to pause workflow
+    /// execution and allow human review or modification of intermediate data.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// match workflow.run(input, &ctx).await {
+    ///     Ok(result) => println!("Completed: {:?}", result),
+    ///     Err(StructuredError::Checkpoint { step_name, data }) => {
+    ///         println!("Paused at '{}'. Data: {}", step_name, data);
+    ///         // Save data for human review, then resume later
+    ///     }
+    ///     Err(e) => eprintln!("Error: {}", e),
+    /// }
+    /// ```
+    #[error("Workflow checkpoint triggered at step '{step_name}'")]
+    Checkpoint {
+        /// The name of the checkpoint step that triggered the pause.
+        step_name: String,
+        /// Serialized intermediate data at the checkpoint.
+        data: serde_json::Value,
+    },
 }
 
 impl StructuredError {
@@ -83,6 +108,24 @@ impl StructuredError {
                 *code == 503 || *code == 429
             }
             _ => false,
+        }
+    }
+
+    /// Check if this error is a workflow checkpoint.
+    ///
+    /// Checkpoints are intentional pauses for human-in-the-loop processing
+    /// and should be handled differently from actual errors.
+    pub fn is_checkpoint(&self) -> bool {
+        matches!(self, Self::Checkpoint { .. })
+    }
+
+    /// Extract checkpoint data if this is a checkpoint error.
+    ///
+    /// Returns `Some((step_name, data))` if this is a checkpoint, `None` otherwise.
+    pub fn checkpoint_data(&self) -> Option<(&str, &serde_json::Value)> {
+        match self {
+            Self::Checkpoint { step_name, data } => Some((step_name, data)),
+            _ => None,
         }
     }
 

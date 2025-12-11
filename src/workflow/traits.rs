@@ -98,6 +98,64 @@ pub trait Step<Input, Output>: Send + Sync {
     {
         MapStep::new(self, f)
     }
+
+    /// Inspect the output of this step without modifying it.
+    ///
+    /// This is useful for logging, debugging, or emitting custom artifacts
+    /// during workflow execution. The function receives both the output and
+    /// the execution context, allowing it to record traces or metrics.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let pipeline = summarizer
+    ///     .tap(|summary, ctx| {
+    ///         println!("Generated summary: {}", summary.text);
+    ///         ctx.emit_artifact("Summarize", "length", &summary.text.len());
+    ///     })
+    ///     .then(email_drafter);
+    /// ```
+    fn tap<F>(self, func: F) -> super::tap::TapStep<Self, F, Input, Output>
+    where
+        Self: Sized + 'static,
+        Input: Send + Sync + 'static,
+        Output: Send + Sync + 'static,
+        F: Fn(&Output, &ExecutionContext) + Send + Sync + 'static,
+    {
+        super::tap::TapStep::new(self, func)
+    }
+
+    /// Wrap this step with automatic start/end event instrumentation.
+    ///
+    /// When the step runs, it will automatically emit:
+    /// - `StepStart` event when execution begins
+    /// - `StepEnd` event on success (with duration)
+    /// - `Error` event on failure
+    ///
+    /// This provides comprehensive workflow tracing without manual instrumentation.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Chain instrumented steps for full execution tracing
+    /// let pipeline = summarizer.named("Summarize")
+    ///     .then(drafter.named("DraftEmail"))
+    ///     .then(sender.named("SendEmail"));
+    ///
+    /// let ctx = ExecutionContext::new();
+    /// let result = pipeline.run(input, &ctx).await?;
+    ///
+    /// // View the execution timeline
+    /// for trace in ctx.trace_snapshot() {
+    ///     println!("{:?}", trace);
+    /// }
+    /// ```
+    fn named(self, name: impl Into<String>) -> super::instrumented::InstrumentedStep<Self>
+    where
+        Self: Sized,
+    {
+        super::instrumented::InstrumentedStep::new(self, name)
+    }
 }
 
 /// Convenience wrapper to turn an async function or closure into a [`Step`].

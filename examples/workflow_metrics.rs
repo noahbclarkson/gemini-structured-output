@@ -14,7 +14,7 @@ use gemini_structured_output::workflow::{ExecutionContext, StateWorkflow, Step, 
 
 // --- Data Models ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 struct Document {
     title: String,
     content: String,
@@ -195,22 +195,18 @@ async fn main() -> Result<()> {
             state.analysis = Some(analysis);
         },
     )
-    .step_fn({
-        move |state: &mut AnalysisState, ctx: &ExecutionContext| {
-            let brief_agent = brief_gen2.clone();
-            async move {
-                let enriched = state.enriched.clone().ok_or_else(|| {
-                    StructuredError::Context(
-                        "analysis step must populate state before generating brief".to_string(),
-                    )
-                })?;
-
-                let brief = brief_agent.run(enriched, ctx).await?;
-                state.brief = Some(brief);
-                Ok(())
-            }
-        }
-    });
+    .with_adapter(
+        brief_gen2,
+        |state: &AnalysisState| {
+            state
+                .enriched
+                .clone()
+                .expect("analysis step must populate state before generating brief")
+        },
+        |state, brief| {
+            state.brief = Some(brief);
+        },
+    );
 
     let (final_state, metrics2) = state_workflow.run().await?;
     let enriched = final_state

@@ -48,7 +48,11 @@ where
 {
     async fn run(&self, (data, context): (Data, Context), ctx: &ExecutionContext) -> Result<Data> {
         let prompt = format!("{}\n\nCONTEXT:\n{}", self.instruction, context);
-        let outcome = self.client.refine(&data, &prompt).await?;
+        let outcome = self
+            .client
+            .refine(data, prompt)
+            .execute()
+            .await?;
 
         // Record step completion
         ctx.record_step();

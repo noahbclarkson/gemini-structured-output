@@ -172,7 +172,7 @@ Do not generate data beyond these periods.";
 
     println!("\n=== Generating Q1 2025 Forecast via Refinement ===");
 
-    let forecast_instruction = r#"
+let forecast_instruction = r#"
 Generate forecast values for Q1 2025 (period "2025-Q1") for all accounts based on their forecast_config:
 1. For accounts with method="growth_rate": Apply the growth_rate to the last historical/forecast value
 2. For accounts with method="percentage_of_revenue": Calculate as percentage of the forecasted revenue
@@ -181,7 +181,10 @@ Generate forecast values for Q1 2025 (period "2025-Q1") for all accounts based o
 5. Update the summary with the new forecasted values. Do not return null; use numeric values.
 "#;
 
-    let forecast_result = client.refine(&enhanced_model, forecast_instruction).await?;
+    let forecast_result = client
+        .refine(enhanced_model, forecast_instruction)
+        .execute()
+        .await?;
 
     println!("\n=== Forecasted Model ===");
     print_model_summary(&forecast_result.value);

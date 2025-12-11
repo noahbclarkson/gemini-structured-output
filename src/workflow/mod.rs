@@ -34,7 +34,11 @@
 //! println!("Total tokens: {}", metrics.total_token_count);
 //! ```
 
+mod batch;
 mod chain;
+mod checkpoint;
+mod events;
+mod instrumented;
 mod legacy;
 mod metrics;
 mod parallel;
@@ -42,17 +46,23 @@ mod reduce;
 mod review;
 mod router;
 mod state;
+mod tap;
 mod traits;
 mod windowed;
 
+pub use batch::{BatchStep, SingleItemAdapter};
 pub use chain::{ChainStep, ChainTupleStep};
+pub use checkpoint::{CheckpointStep, ConditionalCheckpointStep};
+pub use events::{TraceEntry, WorkflowEvent};
+pub use instrumented::InstrumentedStep;
 pub use legacy::{WorkflowAction, WorkflowFuture, WorkflowStep};
 pub use metrics::{ExecutionContext, WorkflowMetrics};
-pub use parallel::ParallelMapStep;
+pub use parallel::{ParallelMapBuilder, ParallelMapStep};
 pub use reduce::{ConfiguredReduceStep, ReduceStep, ReduceStepBuilder};
 pub use review::ReviewStep;
 pub use router::RouterStep;
 pub use state::{LambdaStateStep, StateStep, StateWorkflow, StepAdapter};
+pub use tap::TapStep;
 pub use traits::{BoxedStepExt, LambdaStep, MapStep, Step};
 pub use windowed::WindowedContextStep;
 
