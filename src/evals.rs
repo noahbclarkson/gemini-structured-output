@@ -3,9 +3,13 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::{models::GenerationOutcome, schema::GeminiStructured, StructuredError};
+use crate::{
+    models::GenerationOutcome, schema::GeminiStructured, StructuredClient, StructuredError,
+};
 
 /// A single evaluation result for a test case.
 #[derive(Debug, Clone)]
@@ -43,6 +47,43 @@ pub struct EvalSuite {
     concurrency: usize,
 }
 
+/// Normalized return type for evaluator closures.
+pub struct EvaluatorOutcome<T> {
+    pub outcome: GenerationOutcome<T>,
+    pub passed: bool,
+    pub message: Option<String>,
+}
+
+impl<T> From<(GenerationOutcome<T>, bool)> for EvaluatorOutcome<T> {
+    fn from(value: (GenerationOutcome<T>, bool)) -> Self {
+        Self {
+            outcome: value.0,
+            passed: value.1,
+            message: None,
+        }
+    }
+}
+
+impl<T> From<(GenerationOutcome<T>, bool, String)> for EvaluatorOutcome<T> {
+    fn from(value: (GenerationOutcome<T>, bool, String)) -> Self {
+        Self {
+            outcome: value.0,
+            passed: value.1,
+            message: Some(value.2),
+        }
+    }
+}
+
+impl<T> From<(GenerationOutcome<T>, bool, Option<String>)> for EvaluatorOutcome<T> {
+    fn from(value: (GenerationOutcome<T>, bool, Option<String>)) -> Self {
+        Self {
+            outcome: value.0,
+            passed: value.1,
+            message: value.2,
+        }
+    }
+}
+
 impl EvalSuite {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -58,14 +99,15 @@ impl EvalSuite {
 
     /// Run a list of inputs against an async evaluation function.
     ///
-    /// The `evaluator` function receives the input and should return a `Result<(GenerationOutcome<T>, bool)>`
-    /// along with a pass/fail flag.
-    pub async fn run<I, T, F, Fut>(&self, cases: Vec<(String, I)>, evaluator: F) -> SuiteReport
+    /// The `evaluator` function receives the input and should return either a `(GenerationOutcome<T>, bool)`
+    /// tuple or an `(GenerationOutcome<T>, bool, Option<String>)` tuple for an optional failure message.
+    pub async fn run<I, T, F, Fut, E>(&self, cases: Vec<(String, I)>, evaluator: F) -> SuiteReport
     where
         I: Send + Sync + 'static,
         T: GeminiStructured + Send + Sync,
         F: Fn(I) -> Fut + Send + Sync + Clone + 'static,
-        Fut: Future<Output = Result<(GenerationOutcome<T>, bool), StructuredError>> + Send,
+        Fut: Future<Output = Result<E, StructuredError>> + Send,
+        E: Into<EvaluatorOutcome<T>>,
     {
         let results = Arc::new(Mutex::new(Vec::new()));
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
@@ -88,9 +130,24 @@ impl EvalSuite {
                 let start = Instant::now();
 
                 let eval_res = match eval_fn(input).await {
-                    Ok((outcome, passed)) => {
+                    Ok(raw_outcome) => {
+                        let EvaluatorOutcome {
+                            outcome,
+                            passed,
+                            message,
+                        } = raw_outcome.into();
                         let latency = start.elapsed();
                         let usage = outcome.usage.as_ref();
+                        let error = if passed {
+                            None
+                        } else {
+                            message.or_else(|| {
+                                Some(
+                                    "Evaluator marked case as failed but no message was provided"
+                                        .to_string(),
+                                )
+                            })
+                        };
                         EvalResult {
                             case_name: name.clone(),
                             passed,
@@ -103,7 +160,7 @@ impl EvalSuite {
                                 .unwrap_or(0) as usize,
                             network_attempts: outcome.network_attempts,
                             parse_attempts: outcome.parse_attempts,
-                            error: None,
+                            error,
                         }
                     }
                     Err(e) => EvalResult::fail(name.clone(), format!("{e:?}")),
@@ -234,7 +291,7 @@ impl fmt::Display for SuiteReport {
             for r in self.results.iter().filter(|r| !r.passed) {
                 writeln!(
                     f,
-                    "[{}] Error: {} (network_attempts={}, parse_attempts={}, latency_ms={})",
+                    "[{}] Reason: {} (network_attempts={}, parse_attempts={}, latency_ms={})",
                     r.case_name,
                     r.error.as_deref().unwrap_or("Unknown"),
                     r.network_attempts,
@@ -244,5 +301,84 @@ impl fmt::Display for SuiteReport {
             }
         }
         Ok(())
+    }
+}
+
+/// The standardized output for an LLM judge.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EvaluationVerdict {
+    /// A score between 0.0 and 1.0.
+    pub score: f64,
+    /// A boolean pass/fail flag.
+    pub pass: bool,
+    /// Detailed reasoning for the score.
+    pub reasoning: String,
+}
+
+/// A helper for running LLM-based evaluations.
+#[derive(Clone)]
+pub struct LLMJudge {
+    client: StructuredClient,
+    rubric: String,
+}
+
+impl LLMJudge {
+    pub fn new(client: StructuredClient, rubric: impl Into<String>) -> Self {
+        Self {
+            client,
+            rubric: rubric.into(),
+        }
+    }
+
+    /// Evaluate an outcome.
+    ///
+    /// - `input`: The original context provided to the agent.
+    /// - `config`: The configuration generated by the agent.
+    /// - `simulation_result`: (Optional) The calculated outcome of applying the config.
+    pub async fn evaluate<I, C, R>(
+        &self,
+        input: &I,
+        config: &C,
+        simulation_result: Option<&R>,
+    ) -> crate::Result<EvaluationVerdict>
+    where
+        I: Serialize,
+        C: Serialize,
+        R: Serialize,
+    {
+        let input_json = serde_json::to_string_pretty(input)?;
+        let config_json = serde_json::to_string_pretty(config)?;
+
+        // If a simulation result is provided, we format it; otherwise indicate it's missing.
+        let result_section = if let Some(res) = simulation_result {
+            format!(
+                "### COMPUTED SIMULATION RESULT (Outcome of applying the config):\n{}\n",
+                serde_json::to_string_pretty(res)?
+            )
+        } else {
+            "### COMPUTED SIMULATION RESULT: (not provided)\n".to_string()
+        };
+
+        let prompt = format!(
+            "### TASK: Evaluate the AI's performance based on the Rubric.\n\
+             Focus primarily on whether the COMPUTED SIMULATION RESULT satisfies the INPUT requirements.\n\
+             The 'Generated Configuration' is the means to the end; if the result is correct, valid configurations vary.\n\n\
+             ### RUBRIC:\n{}\n\n\
+             ### INPUT DATA:\n{}\n\n\
+             ### AI GENERATED CONFIGURATION:\n{}\n\n\
+             {}\n\
+             Provide a score (0.0-1.0), pass/fail, and reasoning.",
+            self.rubric, input_json, config_json, result_section
+        );
+
+        let outcome = self
+            .client
+            .request::<EvaluationVerdict>()
+            .system("You are an expert impartial judge. You evaluate technical outcomes.")
+            .user_text(prompt)
+            .execute()
+            .await?;
+
+        Ok(outcome.value)
     }
 }

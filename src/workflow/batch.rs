@@ -170,7 +170,10 @@ mod tests {
     #[tokio::test]
     async fn test_batch_step_basic() {
         let worker = LambdaStep(|(items, multiplier): (Vec<i32>, i32)| async move {
-            Ok(items.into_iter().map(|x| x * multiplier).collect::<Vec<_>>())
+            Ok(items
+                .into_iter()
+                .map(|x| x * multiplier)
+                .collect::<Vec<_>>())
         });
 
         let batch = BatchStep::new(worker, 2, 2);

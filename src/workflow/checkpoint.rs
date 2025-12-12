@@ -78,8 +78,7 @@ where
     T: Serialize + Send + Sync + 'static,
 {
     async fn run(&self, input: T, ctx: &ExecutionContext) -> Result<T> {
-        let data =
-            serde_json::to_value(&input).map_err(StructuredError::Json)?;
+        let data = serde_json::to_value(&input).map_err(StructuredError::Json)?;
 
         ctx.emit(WorkflowEvent::StepEnd {
             step_name: self.name.clone(),
@@ -143,8 +142,7 @@ where
 {
     async fn run(&self, input: T, ctx: &ExecutionContext) -> Result<T> {
         if (self.predicate)(&input) {
-            let data =
-                serde_json::to_value(&input).map_err(StructuredError::Json)?;
+            let data = serde_json::to_value(&input).map_err(StructuredError::Json)?;
 
             ctx.emit(WorkflowEvent::StepEnd {
                 step_name: self.name.clone(),

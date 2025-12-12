@@ -74,6 +74,11 @@ path = "examples/benchmark.rs"
 required-features = ["evals"]
 
 [[example]]
+name = "forecast_eval"
+path = "examples/forecast_eval.rs"
+required-features = ["evals", "macros"]
+
+[[example]]
 name = "macro_tools"
 path = "examples/macro_tools.rs"
 required-features = ["macros"]

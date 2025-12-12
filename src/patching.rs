@@ -10,8 +10,8 @@ use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     client::FallbackStrategy,
-    files::FileManager,
     error::{Result, StructuredError},
+    files::FileManager,
     generator::TextGenerator,
     models::{RefinementAttempt, RefinementOutcome},
     schema::{compile_validator, GeminiStructured, StructuredValidator},
@@ -350,7 +350,9 @@ impl RefinementEngine {
             let patch_text: String = if use_generator {
                 let generator = self
                     .select_generator(attempt_idx, &mut escalated)
-                    .ok_or_else(|| StructuredError::Config("No generator configured".to_string()))?;
+                    .ok_or_else(|| {
+                        StructuredError::Config("No generator configured".to_string())
+                    })?;
 
                 generator
                     .generate_text(
@@ -398,7 +400,8 @@ impl RefinementEngine {
                             }
                             Err(err) => {
                                 let structured = StructuredError::Gemini(err);
-                                if structured.is_retryable() && net_try < self.config.network_retries
+                                if structured.is_retryable()
+                                    && net_try < self.config.network_retries
                                 {
                                     let delay_ms = 200 * 2_u64.pow(net_try as u32);
                                     warn!(

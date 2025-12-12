@@ -164,7 +164,11 @@ where
             system_prompt.push_str(&serde_json::to_string_pretty(&pending.patch)?);
         }
 
-        let messages: Vec<Message> = self.history.iter().map(|entry| entry.message.clone()).collect();
+        let messages: Vec<Message> = self
+            .history
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
 
         Ok((system_prompt, messages))
     }
@@ -304,10 +308,7 @@ where
         }
 
         let effect_summary = if let Some(eff) = effect {
-            text.push_str(&format!(
-                "Observed Effect on Output: {}\n",
-                eff.description
-            ));
+            text.push_str(&format!("Observed Effect on Output: {}\n", eff.description));
             Some(eff.description)
         } else {
             None
@@ -327,15 +328,19 @@ where
     }
 
     /// Squash a refinement outcome into a single history entry.
-    pub fn record_refinement_outcome(&mut self, instruction: String, outcome: &RefinementOutcome<C>) {
+    pub fn record_refinement_outcome(
+        &mut self,
+        instruction: String,
+        outcome: &RefinementOutcome<C>,
+    ) {
         let attempts = outcome.attempts.len();
         if let Some(final_patch) = &outcome.patch {
             let summary = format!(
                 "Applied changes based on: '{}'. (Success after {} attempts)",
                 instruction, attempts
             );
-            let patch_json = serde_json::to_string_pretty(final_patch)
-                .unwrap_or_else(|_| "[]".to_string());
+            let patch_json =
+                serde_json::to_string_pretty(final_patch).unwrap_or_else(|_| "[]".to_string());
 
             self.history.push(
                 SessionEntry::new_state_change(
