@@ -14,6 +14,22 @@ use gemini_structured_output::prelude::*;
 // --- Data Models ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+enum SentimentType {
+    Positive,
+    Negative,
+}
+
+impl std::fmt::Display for SentimentType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SentimentType::Positive => "Positive",
+            SentimentType::Negative => "Negative",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct Article {
     title: String,
     content: String,
@@ -28,7 +44,7 @@ struct Summary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct SentimentAnalysis {
-    sentiment: String,
+    sentiment: SentimentType,
     confidence: f32,
     reasoning: String,
 }
@@ -47,8 +63,9 @@ struct Summarizer;
     input = "Summary",
     output = "SentimentAnalysis",
     system = "Analyze the sentiment of this summary. Determine if the overall \
-              tone is positive, negative, neutral, or mixed. Provide a confidence \
-              score (0.0-1.0) and explain your reasoning."
+              tone is positive, negative or negative. Provide a confidence \
+              score (0.0-1.0) and explain your reasoning. Do not go above 0.5 confidence \
+              unless you are highly certain. 0 means no confidence, 1 means absolute confidence and 0.5 means neutral."
 )]
 struct SentimentAnalyzer;
 
@@ -57,9 +74,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let api_key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY");
+    let model = Model::Custom("models/gemini-2.5-flash-lite-preview-09-2025".to_string());
 
     let client = StructuredClientBuilder::new(api_key)
-        .with_model(Model::Gemini25Flash)
+        .with_model(model)
         .build()?;
 
     // === Example 1: Named Steps with Automatic Tracing ===
@@ -139,7 +157,8 @@ async fn main() -> Result<()> {
                   with major indices dropping sharply before partial recovery. \
                   Concerns about inflation and interest rates continue to weigh \
                   on investor sentiment. Some analysts recommend caution while \
-                  others see buying opportunities."
+                  others see buying opportunities. One analyst noted that performance \
+                  in certain sectors remains resilient despite broader market fears."
             .into(),
     };
 
@@ -167,7 +186,7 @@ async fn main() -> Result<()> {
         .then(sentiment_analyzer3.named("AnalyzeSentiment"))
         .then(ConditionalCheckpointStep::new(
             "LowConfidenceReview",
-            |sentiment: &SentimentAnalysis| sentiment.confidence < 0.7,
+            |sentiment: &SentimentAnalysis| sentiment.confidence <= 0.7,
         ));
 
     let ctx3 = ExecutionContext::new();
@@ -178,7 +197,9 @@ async fn main() -> Result<()> {
                   Employment figures exceeded expectations while consumer spending \
                   showed signs of slowing. Manufacturing output was flat, but \
                   service sector growth remained strong. Economists are divided \
-                  on what this means for the overall trajectory."
+                  on what this means for the overall trajectory. However, one analyst \
+                  cautioned that the data may reflect only short-term fluctuations rather than \
+                    a definitive trend and said that the overall outlook is positive"
             .into(),
     };
 
