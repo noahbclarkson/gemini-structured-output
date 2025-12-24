@@ -82,6 +82,21 @@ impl FileManager {
     /// Upload a file and wait for it to become active.
     pub async fn upload_and_wait<P: AsRef<Path>>(&self, path: P) -> Result<FileHandle> {
         let handle = self.upload_path(path).await?;
+        self.wait_for_active(handle).await
+    }
+
+    /// Upload raw bytes and wait for the file to become active.
+    pub async fn upload_bytes_and_wait(
+        &self,
+        bytes: impl Into<Vec<u8>>,
+        mime_type: &str,
+        display_name: Option<&str>,
+    ) -> Result<FileHandle> {
+        let handle = self.upload_bytes(bytes, mime_type, display_name).await?;
+        self.wait_for_active(handle).await
+    }
+
+    async fn wait_for_active(&self, handle: FileHandle) -> Result<FileHandle> {
         let name = handle.name().to_string();
         let mut attempts = 0;
         loop {
