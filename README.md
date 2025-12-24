@@ -5,9 +5,9 @@
 [![Crates.io](https://img.shields.io/crates/v/gemini-structured-output.svg)](https://crates.io/crates/gemini-structured-output)
 [![Documentation](https://docs.rs/gemini-structured-output/badge.svg)](https://docs.rs/gemini-structured-output)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Gemini API](https://img.shields.io/badge/Gemini-API-8E75B2)](https://ai.google.dev/)
+[![Gemini API](https://img.shields.io/badge/Gemini-2.0%20%7C%203.0%20Ready-8E75B2)](https://ai.google.dev/)
 
-**Production-grade structured generation, self-correcting refinement loops, and type-safe agentic workflows for Google Gemini.**
+**Production-grade structured generation, self-correcting refinement loops, type-safe agentic workflows, and LLM evaluation framework for Google Gemini.**
 
 </div>
 
@@ -26,6 +26,7 @@
     - [The Refinement Engine](#the-refinement-engine)
     - [Context \& Files](#context--files)
     - [Caching](#caching)
+    - [Interactive Sessions](#interactive-sessions)
   - [Workflow Orchestration](#workflow-orchestration)
     - [Steps \& Chains](#steps--chains)
     - [Parallel Processing](#parallel-processing)
@@ -33,11 +34,15 @@
     - [Branching \& Routing](#branching--routing)
     - [Stateful Workflows](#stateful-workflows)
     - [Human-in-the-Loop](#human-in-the-loop)
+    - [Windowed Processing](#windowed-processing)
+  - [Evaluation \& Benchmarking](#-evaluation--benchmarking)
   - [Observability](#observability)
   - [Macros \& Developer Experience](#macros--developer-experience)
     - [Agents](#agents)
     - [Tools](#tools)
     - [Validation](#validation)
+    - [Prompt Templates](#prompt-templates)
+  - [Helper Utilities](#helper-utilities)
   - [Advanced Topics](#advanced-topics)
     - [Custom Adapters](#custom-adapters)
     - [Fallback Strategies](#fallback-strategies)
@@ -65,6 +70,7 @@ Furthermore, it provides a **Type-Safe Workflow Engine** for building complex ag
 *   **🔭 Observability:** Built-in tracing, token counting, and latency metrics for every step in a workflow.
 *   **🤖 Agent Macros:** Define functional agents with `#[gemini_agent]` that compile down to strongly-typed workflow steps.
 *   **🛠️ Tooling System:** Ergonomic `#[gemini_tool]` macro for defining and registering tools/functions.
+*   **📊 Evaluations:** Concurrent suites and LLM-as-a-judge scoring for regression testing.
 *   **💾 File Handling:** Seamless support for uploading PDFs, images, and videos for multimodal analysis.
 *   **🔌 Adapters:** specialized serializers for `HashMap`, `Duration`, and other complex types that LLMs usually struggle with.
 
@@ -105,9 +111,11 @@ struct SentimentReport {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 2. Initialize the client
+    // 2. Initialize the client (using Gemini 3 for native schema support)
     let api_key = std::env::var("GEMINI_API_KEY").expect("API Key needed");
-    let client = StructuredClientBuilder::new(api_key).build()?;
+    let client = StructuredClientBuilder::new(api_key)
+        .with_model(Model::Custom("gemini-3-pro-preview".to_string()))
+        .build()?;
 
     // 3. Generate
     let report: SentimentReport = client
@@ -136,7 +144,7 @@ async fn main() -> Result<()> {
 
 ### Structured Generation
 
-The library leverages `schemars` to generate an OpenAPI 3.0 schema from your Rust structs. This schema is passed to Gemini either via generation configuration (Gemini 1.5 Pro/Flash) or injected into the system prompt for legacy compatibility.
+The library leverages `schemars` to generate an OpenAPI 3.0 schema from your Rust structs. For newer models (Gemini 2.0/3.0 or `gemini-experiment`), the schema is enforced via native generation config; older models fall back to system prompt injection for compatibility.
 
 The `StructuredRequest` builder allows you to configure:
 
@@ -200,6 +208,33 @@ let client = StructuredClientBuilder::new(key)
 ```
 
 The library automatically hashes your system prompt + schema + tools to create a deterministic cache key. Subsequent requests reuse the cached context, saving tokens and reducing latency.
+
+### Interactive Sessions
+
+For chat interfaces that maintain structured state (like a configuration wizard or settings editor), use `InteractiveSession`. It manages conversation history, tracks state changes via JSON Patch, and handles "pending" changes requiring user approval.
+
+```rust
+use gemini_structured_output::session::InteractiveSession;
+
+let mut session = InteractiveSession::new(initial_config, None);
+
+// 1. Chat with the current state as context
+let response = session.chat(&client, "Change the currency to EUR").await?;
+println!("Assistant: {}", response.message);
+
+// 2. Request a structured change
+let pending = session.request_change(&client, "Update currency to USD").await?;
+println!("Proposed Patch: {:?}", pending.patch);
+
+// 3. Commit or reject the change
+session.accept_change()?;
+// or: session.reject_change()?;
+```
+
+This is particularly useful for:
+- Multi-turn configuration dialogs
+- Collaborative editing interfaces
+- Approval workflows where changes need review before application
 
 ---
 
@@ -284,6 +319,41 @@ When the checkpoint is hit, the workflow returns a special error containing the 
 
 ---
 
+### Windowed Processing
+
+For processing large lists where items need shared context (but not all at once), use `WindowedContextStep`.
+
+```rust
+// Process items in windows of 10, running 3 windows concurrently
+let windowed = WindowedContextStep::new(agent, 10, 3);
+let results = windowed.run((items, shared_context), &ctx).await?;
+```
+
+---
+
+## 📊 Evaluation & Benchmarking
+
+Production AI requires testing. The `evals` feature provides a concurrent test runner and an LLM-as-a-Judge implementation.
+
+```rust
+// 1. Define the Judge
+let judge = LLMJudge::new(client.clone(), "Score accuracy 0.0-1.0 based on...");
+
+// 2. Run a Suite
+let report = EvalSuite::new("Extraction Benchmark")
+    .with_concurrency(5)
+    .run(test_cases, |(input, expected)| async move {
+        let result = agent.run(input, &ctx).await?;
+        // Return outcome for the judge
+        Ok((result, true))
+    })
+    .await;
+
+println!("{}", report); // Prints latency P95, token usage, and pass/fail rates
+```
+
+---
+
 ## Observability
 
 The library tracks detailed metrics for every workflow execution via `ExecutionContext`.
@@ -359,6 +429,32 @@ struct UserProfile {
 }
 ```
 
+### Prompt Templates
+
+Use `#[derive(GeminiPrompt)]` to create type-safe prompt templates that interpolate struct fields.
+
+```rust
+#[derive(GeminiPrompt)]
+#[gemini(template = "Analyze the {doc_type} titled '{title}' for sentiment.")]
+struct AnalysisRequest {
+    doc_type: String,
+    title: String,
+}
+
+let req = AnalysisRequest { doc_type: "Memo".into(), title: "Q3 Update".into() };
+// usage: client.user_text(req.to_string())
+```
+
+---
+
+## Helper Utilities
+
+Enable the `helpers` feature for utilities that format data for LLM consumption.
+
+*   `csv_to_markdown`: Converts raw CSV strings into aligned Markdown tables.
+*   `json_array_to_markdown`: Converts vector of objects to tables.
+*   `bullet_list` / `numbered_list`: Quick formatting for prompt construction.
+
 ---
 
 ## Advanced Topics
@@ -384,10 +480,10 @@ Configure the client to automatically escalate to a smarter model (e.g., Pro) if
 
 ```rust
 let client = StructuredClientBuilder::new(key)
-    .with_model(Model::Gemini25Flash)
+    .with_model(Model::Custom("gemini-3-pro-preview".to_string()))
     .with_fallback_strategy(FallbackStrategy::Escalate {
         after_attempts: 2,
-        target: Model::Gemini25Pro,
+        target: Model::Custom("gemini-3-pro-preview".to_string()),
     })
     .build()?;
 ```
@@ -413,8 +509,11 @@ The `examples/` directory contains rich, runnable scenarios:
 | Example                    | Description                                               |
 | :------------------------- | :-------------------------------------------------------- |
 | `basic_structured.rs`      | Simple extraction of a struct from text.                  |
-| `financial_forecast.rs`    | Complex nested schemas, HashMaps, and Refinement loops.   |
+| `financial_forecast.rs`    | Complex nested schemas, HashMaps, and refinement loops.   |
 | `agentic_workflow.rs`      | Branching, parallel processing, and typed steps.          |
+| `agentic_batching.rs`      | Windowed context processing over large datasets.          |
+| `benchmark.rs`             | Evaluation suite runner with latency and pass/fail stats. |
+| `forecast_eval.rs`         | LLM-as-a-judge evaluation of structured forecasts.        |
 | `tool_loop.rs`             | Using tools/function calling within a structured request. |
 | `refinement_with_files.rs` | Uploading a PDF and refining extracted data against it.   |
 | `observability.rs`         | Demonstrates traces, metrics, and checkpoints.            |
@@ -433,9 +532,11 @@ GEMINI_API_KEY=your_key cargo run --example agentic_workflow --features macros
 
 The `StructuredClientBuilder` offers extensive customization:
 
+**Gemini 3 / 2.0 Support:** When using newer models (e.g., `gemini-3-pro-preview` or models containing `gemini-experiment`), the client automatically switches from system-prompt schema injection to **native config schema enforcement**. This improves adherence and performance. No code change is required; simply set the model version.
+
 ```rust
 StructuredClientBuilder::new(api_key)
-    .with_model(Model::Gemini25Flash)
+    .with_model(Model::Custom("gemini-3-pro-preview".to_string()))
     // Caching
     .with_cache_policy(CachePolicy::Enabled { ttl: Duration::from_secs(300) })
     // Refinement Logic
