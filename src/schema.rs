@@ -2,7 +2,7 @@ use schemars::{
     generate::{SchemaGenerator, SchemaSettings},
     JsonSchema,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, StructuredError};
@@ -83,12 +83,63 @@ pub trait GeminiValidator {
 
 /// Recursively strip or normalize fields that Gemini strict schema mode does not support.
 pub fn clean_schema_for_gemini(value: &mut Value) {
+    let snapshot = value.clone();
+    let mut stack = Vec::new();
+    inline_refs(value, &snapshot, &mut stack);
+    strip_unsupported(value);
+}
+
+fn inline_refs(value: &mut Value, root: &Value, stack: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get("$ref") {
+                let reference = reference.clone();
+                if stack.contains(&reference) {
+                    *value = Value::Object(Map::new());
+                    return;
+                }
+                if let Some(resolved) = resolve_pointer(root, &reference) {
+                    stack.push(reference);
+                    let mut resolved = resolved.clone();
+                    inline_refs(&mut resolved, root, stack);
+                    stack.pop();
+                    *value = resolved;
+                    return;
+                }
+                *value = Value::Object(Map::new());
+                return;
+            }
+
+            for (_, v) in map.iter_mut() {
+                inline_refs(v, root, stack);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                inline_refs(v, root, stack);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_pointer<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix('#').unwrap_or(reference);
+    root.pointer(pointer)
+}
+
+fn strip_unsupported(value: &mut Value) {
     if let Value::Object(map) = value {
         // Keywords unsupported by Gemini strict mode that we should strip.
-        // Note: 'title' and 'additionalProperties' are supported and must be preserved
-        // because they can be legitimate field names in user schemas.
+        // Note: 'title' is preserved to guide the model output. 'additionalProperties'
+        // and OpenAPI definition blocks are stripped to satisfy the v1beta schema validator.
         let unsupported = [
             "$schema",
+            "$ref",
+            "additionalProperties",
+            "components",
+            "definitions",
+            "$defs",
             "default",
             "examples",
             "pattern",
@@ -103,6 +154,7 @@ pub fn clean_schema_for_gemini(value: &mut Value) {
             "then",
             "else",
             "const",
+            "allOf",
         ];
 
         for key in unsupported {
@@ -115,16 +167,16 @@ pub fn clean_schema_for_gemini(value: &mut Value) {
             if key == "properties" || key == "definitions" || key == "$defs" {
                 if let Value::Object(sub_map) = v {
                     for (_, sub_schema) in sub_map.iter_mut() {
-                        clean_schema_for_gemini(sub_schema);
+                        strip_unsupported(sub_schema);
                     }
                 }
             } else {
-                clean_schema_for_gemini(v);
+                strip_unsupported(v);
             }
         }
     } else if let Value::Array(arr) = value {
         for v in arr {
-            clean_schema_for_gemini(v);
+            strip_unsupported(v);
         }
     }
 }
@@ -167,6 +219,7 @@ mod tests {
     use super::*;
     use schemars::JsonSchema;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[derive(JsonSchema)]
     struct Contact {
@@ -206,5 +259,36 @@ mod tests {
             .expect("type should be array");
         assert!(types.contains(&json!("string")));
         assert!(types.contains(&json!("null")));
+    }
+
+    #[derive(JsonSchema)]
+    struct MapWrapper {
+        map: HashMap<String, String>,
+    }
+
+    #[test]
+    fn map_schemas_strip_additional_properties() {
+        let schema = MapWrapper::gemini_schema();
+        let map_schema = schema
+            .get("properties")
+            .and_then(|p| p.get("map"))
+            .expect("map schema should exist");
+
+        assert!(map_schema.get("additionalProperties").is_none());
+    }
+
+    #[derive(JsonSchema)]
+    struct Node {
+        value: String,
+        child: Option<Box<Node>>,
+    }
+
+    #[test]
+    fn recursive_schemas_inline_refs() {
+        let schema = Node::gemini_schema();
+        let schema_json = schema.to_string();
+
+        assert!(!schema_json.contains("\"$ref\""));
+        assert!(!schema_json.contains("\"components\""));
     }
 }

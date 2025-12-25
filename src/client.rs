@@ -17,7 +17,7 @@ use crate::{
         ArrayPatchStrategy, PatchStrategy, RefinementConfig, RefinementEngine, RefinementRequest,
         ValidationFailureStrategy,
     },
-    schema::{GeminiStructured, StructuredValidator},
+    schema::{clean_schema_for_gemini, GeminiStructured, StructuredValidator},
     tools::ToolRegistry,
     StructuredRequest,
 };
@@ -507,8 +507,10 @@ impl StructuredClient {
             });
         }
 
+        let mut cleaned_schema = json_schema;
+        clean_schema_for_gemini(&mut cleaned_schema);
         let mut generation_config = generation_config.unwrap_or_default();
-        generation_config.response_schema = Some(json_schema);
+        generation_config.response_schema = Some(cleaned_schema);
         generation_config
             .response_mime_type
             .get_or_insert_with(|| "application/json".to_string());
