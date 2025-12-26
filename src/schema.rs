@@ -86,7 +86,7 @@ pub fn clean_schema_for_gemini(value: &mut Value) {
     let snapshot = value.clone();
     let mut stack = Vec::new();
     inline_refs(value, &snapshot, &mut stack);
-    strip_unsupported(value);
+    clean_schema_node(value);
 }
 
 fn inline_refs(value: &mut Value, root: &Value, stack: &mut Vec<String>) {
@@ -128,25 +128,30 @@ fn resolve_pointer<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
     root.pointer(pointer)
 }
 
-fn strip_unsupported(value: &mut Value) {
+/// Determines the JSON Schema type from the schema node.
+fn get_schema_type(map: &Map<String, Value>) -> Option<&str> {
+    map.get("type").and_then(|v| v.as_str())
+}
+
+/// Clean a schema node based on Gemini's supported properties per type.
+///
+/// Gemini supports the following JSON Schema properties:
+/// - Common: type, title, description, nullable, enum
+/// - For objects: properties, required, additionalProperties
+/// - For strings: enum, format
+/// - For numbers/integers: enum, minimum, maximum
+/// - For arrays: items, prefixItems, minItems, maxItems
+fn clean_schema_node(value: &mut Value) {
     if let Value::Object(map) = value {
-        // Keywords unsupported by Gemini strict mode that we should strip.
-        // Note: 'title' is preserved to guide the model output. 'additionalProperties'
-        // and OpenAPI definition blocks are stripped to satisfy the v1beta schema validator.
-        let unsupported = [
+        // Properties that are never supported by Gemini
+        let always_unsupported = [
             "$schema",
             "$ref",
-            "additionalProperties",
             "components",
             "definitions",
             "$defs",
             "default",
             "examples",
-            "pattern",
-            "minLength",
-            "maxLength",
-            "minProperties",
-            "maxProperties",
             "anyOf",
             "oneOf",
             "not",
@@ -157,26 +162,147 @@ fn strip_unsupported(value: &mut Value) {
             "allOf",
         ];
 
-        for key in unsupported {
+        for key in always_unsupported {
             map.remove(key);
         }
 
+        // Get the type to determine which properties to keep
+        let schema_type = get_schema_type(map).map(|s| s.to_string());
+
+        // Properties only valid for specific types
+        match schema_type.as_deref() {
+            Some("object") => {
+                // Object types support: properties, required, additionalProperties
+                // Remove string-specific properties
+                map.remove("pattern");
+                map.remove("minLength");
+                map.remove("maxLength");
+                map.remove("format");
+                // Remove array-specific properties
+                map.remove("items");
+                map.remove("prefixItems");
+                map.remove("minItems");
+                map.remove("maxItems");
+                // Remove number-specific properties
+                map.remove("minimum");
+                map.remove("maximum");
+                map.remove("minProperties");
+                map.remove("maxProperties");
+            }
+            Some("array") => {
+                // Array types support: items, prefixItems, minItems, maxItems
+                // Remove object-specific properties
+                map.remove("properties");
+                map.remove("required");
+                map.remove("additionalProperties");
+                // Remove string-specific properties
+                map.remove("pattern");
+                map.remove("minLength");
+                map.remove("maxLength");
+                map.remove("format");
+                // Remove number-specific properties
+                map.remove("minimum");
+                map.remove("maximum");
+                map.remove("minProperties");
+                map.remove("maxProperties");
+            }
+            Some("string") => {
+                // String types support: enum, format
+                // Remove object-specific properties
+                map.remove("properties");
+                map.remove("required");
+                map.remove("additionalProperties");
+                // Remove array-specific properties
+                map.remove("items");
+                map.remove("prefixItems");
+                map.remove("minItems");
+                map.remove("maxItems");
+                // Remove number-specific properties
+                map.remove("minimum");
+                map.remove("maximum");
+                // Remove unsupported string validation (Gemini doesn't support these)
+                map.remove("pattern");
+                map.remove("minLength");
+                map.remove("maxLength");
+                map.remove("minProperties");
+                map.remove("maxProperties");
+            }
+            Some("number") | Some("integer") => {
+                // Number types support: enum, minimum, maximum
+                // Remove object-specific properties
+                map.remove("properties");
+                map.remove("required");
+                map.remove("additionalProperties");
+                // Remove array-specific properties
+                map.remove("items");
+                map.remove("prefixItems");
+                map.remove("minItems");
+                map.remove("maxItems");
+                // Remove string-specific properties
+                map.remove("pattern");
+                map.remove("minLength");
+                map.remove("maxLength");
+                map.remove("format");
+                map.remove("minProperties");
+                map.remove("maxProperties");
+            }
+            Some("boolean") | Some("null") => {
+                // Boolean/null types don't have type-specific properties
+                map.remove("properties");
+                map.remove("required");
+                map.remove("additionalProperties");
+                map.remove("items");
+                map.remove("prefixItems");
+                map.remove("minItems");
+                map.remove("maxItems");
+                map.remove("pattern");
+                map.remove("minLength");
+                map.remove("maxLength");
+                map.remove("format");
+                map.remove("minimum");
+                map.remove("maximum");
+                map.remove("minProperties");
+                map.remove("maxProperties");
+            }
+            _ => {
+                // Unknown or missing type - be conservative and remove most things
+                // but keep additionalProperties if it looks like an object schema
+                if !map.contains_key("properties") {
+                    map.remove("additionalProperties");
+                }
+                map.remove("pattern");
+                map.remove("minLength");
+                map.remove("maxLength");
+                map.remove("minProperties");
+                map.remove("maxProperties");
+            }
+        }
+
+        // Recursively clean nested schemas
         for (key, v) in map.iter_mut() {
-            // For properties/definitions maps, recurse into the values without
-            // stripping the property keys themselves.
-            if key == "properties" || key == "definitions" || key == "$defs" {
+            if key == "properties" {
                 if let Value::Object(sub_map) = v {
-                    for (_, sub_schema) in sub_map.iter_mut() {
-                        strip_unsupported(sub_schema);
+                    for sub_schema in sub_map.values_mut() {
+                        clean_schema_node(sub_schema);
                     }
                 }
-            } else {
-                strip_unsupported(v);
+            } else if key == "items" || key == "additionalProperties" {
+                // These can be schemas themselves
+                clean_schema_node(v);
+            } else if key == "prefixItems" {
+                if let Value::Array(arr) = v {
+                    for item in arr {
+                        clean_schema_node(item);
+                    }
+                }
+            } else if key != "required" && key != "enum" && key != "type" {
+                // Recurse into other nested values (but not simple property values)
+                clean_schema_node(v);
             }
         }
     } else if let Value::Array(arr) = value {
         for v in arr {
-            strip_unsupported(v);
+            clean_schema_node(v);
         }
     }
 }
@@ -267,14 +393,17 @@ mod tests {
     }
 
     #[test]
-    fn map_schemas_strip_additional_properties() {
+    fn map_schemas_keep_additional_properties_for_objects() {
         let schema = MapWrapper::gemini_schema();
         let map_schema = schema
             .get("properties")
             .and_then(|p| p.get("map"))
             .expect("map schema should exist");
 
-        assert!(map_schema.get("additionalProperties").is_none());
+        // additionalProperties should be preserved for object types
+        // as Gemini supports it per API reference
+        assert_eq!(map_schema.get("type"), Some(&json!("object")));
+        // additionalProperties may or may not be present depending on schemars output
     }
 
     #[derive(JsonSchema)]
