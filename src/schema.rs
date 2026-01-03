@@ -1,8 +1,10 @@
+use std::collections::HashSet;
+
 use schemars::{
     generate::{SchemaGenerator, SchemaSettings},
     JsonSchema,
 };
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, StructuredError};
@@ -133,6 +135,141 @@ fn get_schema_type(map: &Map<String, Value>) -> Option<&str> {
     map.get("type").and_then(|v| v.as_str())
 }
 
+/// Common tag field names used for internally-tagged enums
+const TAG_FIELD_NAMES: &[&str] = &["type", "kind", "model", "variant", "tag"];
+
+/// Merges enum values from a new variant into an existing tag field
+fn merge_tag_field(existing: &mut Value, new_variant: &Value) {
+    // Extract enum values from both existing and new
+    let existing_enums = existing
+        .as_object()
+        .and_then(|obj| obj.get("enum"))
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let new_enums = new_variant
+        .as_object()
+        .and_then(|obj| obj.get("enum"))
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Merge enum values, avoiding duplicates
+    let mut merged: Vec<Value> = existing_enums;
+    for val in new_enums {
+        if !merged.contains(&val) {
+            merged.push(val);
+        }
+    }
+
+    // Update the existing field with merged enum
+    if let Some(obj) = existing.as_object_mut() {
+        if !merged.is_empty() {
+            obj.insert("enum".to_string(), json!(merged));
+        }
+        // Merge descriptions if both have them
+        if let (Some(existing_desc), Some(new_desc)) = (
+            obj.get("description").and_then(|d| d.as_str()),
+            new_variant
+                .as_object()
+                .and_then(|o| o.get("description"))
+                .and_then(|d| d.as_str()),
+        ) {
+            if existing_desc != new_desc && !existing_desc.contains(new_desc) {
+                obj.insert(
+                    "description".to_string(),
+                    json!(format!("{} | {}", existing_desc, new_desc)),
+                );
+            }
+        }
+    }
+}
+
+/// Merges multiple schema variants into a single permissive object schema.
+/// This allows Gemini to understand enum types by flattening all variant properties
+/// into a single schema with the tag field containing all possible values.
+fn flatten_variants(parent: &mut Map<String, Value>, variants: Vec<Value>) {
+    // Force type to object
+    parent.insert("type".to_string(), json!("object"));
+
+    // Initialize or get the properties map
+    let parent_props = parent
+        .entry("properties".to_string())
+        .or_insert(json!({}))
+        .as_object_mut();
+
+    let Some(parent_props) = parent_props else {
+        return;
+    };
+
+    // Track required fields across variants for intersection
+    let mut common_required: Option<HashSet<String>> = None;
+
+    // Collect all descriptions from variants for the parent
+    let mut variant_descriptions: Vec<String> = Vec::new();
+
+    for variant in variants {
+        if let Value::Object(v_map) = variant {
+            // Collect variant description
+            if let Some(desc) = v_map.get("description").and_then(|d| d.as_str()) {
+                variant_descriptions.push(desc.to_string());
+            }
+
+            // Merge properties from this variant
+            if let Some(Value::Object(props)) = v_map.get("properties") {
+                for (k, v) in props {
+                    if !parent_props.contains_key(k) {
+                        parent_props.insert(k.clone(), v.clone());
+                    } else if TAG_FIELD_NAMES.contains(&k.as_str()) {
+                        // Merge enum values for tag fields
+                        merge_tag_field(parent_props.get_mut(k).unwrap(), v);
+                    }
+                }
+            }
+
+            // Intersect required fields (only keep fields required in ALL variants)
+            if let Some(Value::Array(req_arr)) = v_map.get("required") {
+                let variant_required: HashSet<String> = req_arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+
+                common_required = Some(match common_required.take() {
+                    Some(existing) => existing.intersection(&variant_required).cloned().collect(),
+                    None => variant_required,
+                });
+            }
+        }
+    }
+
+    // Set the intersected required fields
+    if let Some(required) = common_required {
+        if !required.is_empty() {
+            let required_vec: Vec<Value> = required.into_iter().map(Value::String).collect();
+            parent.insert("required".to_string(), json!(required_vec));
+        }
+    }
+
+    // Add combined description if we collected any
+    if !variant_descriptions.is_empty() && !parent.contains_key("description") {
+        parent.insert(
+            "description".to_string(),
+            json!(format!(
+                "One of the following variants: {}",
+                variant_descriptions.join(" | ")
+            )),
+        );
+    }
+
+    // Recursively clean the merged properties
+    if let Some(Value::Object(props)) = parent.get_mut("properties") {
+        for sub_schema in props.values_mut() {
+            clean_schema_node(sub_schema);
+        }
+    }
+}
+
 /// Clean a schema node based on Gemini's supported properties per type.
 ///
 /// Gemini supports the following JSON Schema properties:
@@ -152,8 +289,6 @@ fn clean_schema_node(value: &mut Value) {
             "$defs",
             "default",
             "examples",
-            "anyOf",
-            "oneOf",
             "not",
             "if",
             "then",
@@ -164,6 +299,11 @@ fn clean_schema_node(value: &mut Value) {
 
         for key in always_unsupported {
             map.remove(key);
+        }
+
+        // Handle oneOf/anyOf by flattening into a single object schema
+        if let Some(Value::Array(arr)) = map.remove("oneOf").or_else(|| map.remove("anyOf")) {
+            flatten_variants(map, arr);
         }
 
         // Get the type to determine which properties to keep
