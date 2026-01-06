@@ -306,8 +306,10 @@ fn clean_schema_node(value: &mut Value) {
             // Check if this is a simple string enum (e.g., Rust unit variants)
             // Schemars generates these as: { "type": "string", "const": "Value" }
             let is_pure_string_enum = variants.iter().all(|v| {
-                v.get("type").and_then(|t| t.as_str()) == Some("string")
-                    && (v.get("const").is_some() || v.get("enum").is_some())
+                let is_string = v.get("type").and_then(|t| t.as_str()) == Some("string");
+                let has_const_string = v.get("const").and_then(|c| c.as_str()).is_some();
+                let has_enum = v.get("enum").is_some();
+                (is_string || has_const_string || has_enum) && (v.get("const").is_some() || has_enum)
             });
 
             if is_pure_string_enum {
@@ -330,12 +332,14 @@ fn clean_schema_node(value: &mut Value) {
             } else {
                 // Check for mixed types (Strings AND Objects)
                 // This happens in Rust enums with both Unit and Struct variants
-                let has_objects = variants
-                    .iter()
-                    .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("object"));
-                let has_strings = variants
-                    .iter()
-                    .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("string"));
+                let has_objects = variants.iter().any(|v| {
+                    v.get("type").and_then(|t| t.as_str()) == Some("object")
+                        || v.get("properties").is_some()
+                });
+                let has_strings = variants.iter().any(|v| {
+                    v.get("type").and_then(|t| t.as_str()) == Some("string")
+                        || v.get("const").and_then(|c| c.as_str()).is_some()
+                });
 
                 if has_objects && has_strings {
                     // CASE 2: Mixed Enum (e.g., SeasonalityProfileId with both "Flat" and { "Custom": ... })
@@ -351,6 +355,9 @@ fn clean_schema_node(value: &mut Value) {
                     // Remove specific type constraints from the parent if they exist
                     // because the child can be either string OR object.
                     map.remove("type");
+                    map.remove("properties");
+                    map.remove("required");
+                    map.remove("enum");
                 } else {
                     // CASE 3: Complex Object Union
                     // Proceed with existing flattening logic
