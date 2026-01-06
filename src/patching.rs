@@ -656,11 +656,24 @@ impl RefinementEngine {
                 let mut errors = Vec::new();
 
                 for op in &patch.0 {
+                    let path = op_path(op);
+
+                    // Check if the parent path is valid (not null or missing)
+                    // This prevents errors when LLM generates patches targeting paths through null values
+                    if !is_parent_path_valid(&doc, &path) {
+                        errors.push(format!(
+                            "Skipped op (path: {}): parent path is null or missing - \
+                             you may need to set the parent object first before setting nested fields",
+                            path
+                        ));
+                        continue;
+                    }
+
                     let mut temp = doc.clone();
                     let single = json_patch::Patch(vec![op.clone()]);
                     match json_patch::patch(&mut temp, &single) {
                         Ok(_) => doc = temp,
-                        Err(e) => errors.push(format!("Op failed (path: {}): {}", op_path(op), e)),
+                        Err(e) => errors.push(format!("Op failed (path: {}): {}", path, e)),
                     }
                 }
 
@@ -779,6 +792,49 @@ fn clean_patch_text(patch_text: &str) -> &str {
     trimmed
 }
 
+/// Check if the parent path of a JSON Pointer is valid and not null.
+///
+/// For a path like "/a/b/c/d", this checks that "/a/b/c" exists and is not null.
+/// This prevents patch operations from failing when trying to traverse through null values.
+fn is_parent_path_valid(doc: &Value, path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.is_empty() {
+        return true; // Root path is always valid
+    }
+
+    // Check all parent segments (all except the last one)
+    let parent_segments = &segments[..segments.len() - 1];
+
+    let mut current = doc;
+    for segment in parent_segments {
+        match current {
+            Value::Object(map) => {
+                match map.get(*segment) {
+                    Some(Value::Null) => return false, // Can't traverse through null
+                    Some(v) => current = v,
+                    None => return false, // Path doesn't exist
+                }
+            }
+            Value::Array(arr) => {
+                if let Ok(idx) = segment.parse::<usize>() {
+                    match arr.get(idx) {
+                        Some(Value::Null) => return false, // Can't traverse through null
+                        Some(v) => current = v,
+                        None => return false, // Index out of bounds
+                    }
+                } else {
+                    return false; // Invalid array index
+                }
+            }
+            Value::Null => return false, // Can't traverse through null
+            _ => return false, // Can't traverse into primitives
+        }
+    }
+
+    true
+}
+
 fn op_path(op: &json_patch::PatchOperation) -> String {
     use json_patch::PatchOperation;
 
@@ -894,5 +950,66 @@ mod tests {
             value: serde_json::json!("test"),
         });
         assert_eq!(extract_array_index(&op), None);
+    }
+
+    #[test]
+    fn test_is_parent_path_valid() {
+        // Valid paths
+        let doc = serde_json::json!({
+            "a": {
+                "b": {
+                    "c": "value"
+                }
+            }
+        });
+        assert!(is_parent_path_valid(&doc, "/a/b/c"));
+        assert!(is_parent_path_valid(&doc, "/a/b"));
+        assert!(is_parent_path_valid(&doc, "/a"));
+
+        // Path through null
+        let doc_with_null = serde_json::json!({
+            "items": [
+                { "source": null }
+            ]
+        });
+        assert!(!is_parent_path_valid(
+            &doc_with_null,
+            "/items/0/source/document"
+        ));
+
+        // Valid path to null (parent exists)
+        assert!(is_parent_path_valid(&doc_with_null, "/items/0/source"));
+
+        // Missing path
+        assert!(!is_parent_path_valid(&doc, "/a/x/y"));
+    }
+
+    #[test]
+    fn test_apply_patch_skips_null_parent_paths() {
+        let original = serde_json::json!({
+            "items": [
+                {
+                    "name": "Item 1",
+                    "metadata": null
+                }
+            ]
+        });
+
+        // Try to patch through a null value
+        let patch_json = r#"[
+            {"op": "replace", "path": "/items/0/metadata/description", "value": "test"},
+            {"op": "replace", "path": "/items/0/name", "value": "Updated Item"}
+        ]"#;
+
+        let engine = RefinementEngine::new(Arc::new(Gemini::new("test").unwrap()), None);
+        let patch: json_patch::Patch = serde_json::from_str(patch_json).unwrap();
+        let (result, errors) = engine.apply_patches(&original, &patch);
+
+        // First op should be skipped (null parent), second should succeed
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("parent path is null"));
+
+        // The second patch should still have been applied
+        assert_eq!(result["items"][0]["name"], "Updated Item");
     }
 }

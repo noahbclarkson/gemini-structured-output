@@ -589,17 +589,17 @@ mod tests {
     }
 
     #[test]
-    fn map_schemas_keep_additional_properties_for_objects() {
+    fn map_schemas_strip_additional_properties() {
         let schema = MapWrapper::gemini_schema();
         let map_schema = schema
             .get("properties")
             .and_then(|p| p.get("map"))
             .expect("map schema should exist");
 
-        // additionalProperties should be preserved for object types
-        // as Gemini supports it per API reference
+        // additionalProperties is stripped because Gemini rejects it in practice
+        // (especially within anyOf variants), despite documentation claiming support
         assert_eq!(map_schema.get("type"), Some(&json!("object")));
-        // additionalProperties may or may not be present depending on schemars output
+        assert!(map_schema.get("additionalProperties").is_none());
     }
 
     #[derive(JsonSchema)]
