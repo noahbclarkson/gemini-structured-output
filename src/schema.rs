@@ -368,10 +368,10 @@ fn clean_schema_node(value: &mut Value) {
         // Properties only valid for specific types
         match schema_type.as_deref() {
             Some("object") => {
-                // Object types support: properties, required, additionalProperties
-                // NOTE: We preserve additionalProperties to support HashMaps and other
-                // dynamic key-value structures. Previous versions stripped it due to
-                // issues with anyOf, but strictly typed Maps require it.
+                // Object types support: properties, required
+                // Note: additionalProperties is documented as supported but causes errors
+                // in practice (especially within anyOf variants), so we remove it
+                map.remove("additionalProperties");
                 // Remove string-specific properties
                 map.remove("pattern");
                 map.remove("minLength");
@@ -589,21 +589,17 @@ mod tests {
     }
 
     #[test]
-    fn map_schemas_preserve_additional_properties() {
+    fn map_schemas_strip_additional_properties() {
         let schema = MapWrapper::gemini_schema();
         let map_schema = schema
             .get("properties")
             .and_then(|p| p.get("map"))
             .expect("map schema should exist");
 
-        // additionalProperties must be preserved to support HashMaps.
-        // Without it, Gemini sees { "type": "object" } with no properties defined,
-        // which triggers "properties: should be non-empty for OBJECT type" errors.
+        // additionalProperties is stripped because Gemini rejects it in practice
+        // (especially within anyOf variants), despite documentation claiming support
         assert_eq!(map_schema.get("type"), Some(&json!("object")));
-        let additional_props = map_schema
-            .get("additionalProperties")
-            .expect("additionalProperties should be preserved for HashMap support");
-        assert_eq!(additional_props.get("type"), Some(&json!("string")));
+        assert!(map_schema.get("additionalProperties").is_none());
     }
 
     #[derive(JsonSchema)]
