@@ -281,6 +281,7 @@ fn flatten_variants(parent: &mut Map<String, Value>, variants: Vec<Value>) {
 fn clean_schema_node(value: &mut Value) {
     if let Value::Object(map) = value {
         // Properties that are never supported by Gemini
+        // Note: "const" is handled manually below during oneOf/anyOf processing
         let always_unsupported = [
             "$schema",
             "$ref",
@@ -293,7 +294,6 @@ fn clean_schema_node(value: &mut Value) {
             "if",
             "then",
             "else",
-            "const",
             "allOf",
         ];
 
@@ -301,10 +301,66 @@ fn clean_schema_node(value: &mut Value) {
             map.remove(key);
         }
 
-        // Handle oneOf/anyOf by flattening into a single object schema
-        if let Some(Value::Array(arr)) = map.remove("oneOf").or_else(|| map.remove("anyOf")) {
-            flatten_variants(map, arr);
+        // Handle oneOf/anyOf intelligently based on variant types
+        if let Some(Value::Array(variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf")) {
+            // Check if this is a simple string enum (e.g., Rust unit variants)
+            // Schemars generates these as: { "type": "string", "const": "Value" }
+            let is_pure_string_enum = variants.iter().all(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some("string")
+                    && (v.get("const").is_some() || v.get("enum").is_some())
+            });
+
+            if is_pure_string_enum {
+                // CASE 1: Pure String Enum (e.g., AccountType)
+                // Convert to { "type": "string", "enum": ["A", "B"] }
+                let mut enum_values = Vec::new();
+                for v in variants {
+                    if let Some(c) = v.get("const") {
+                        enum_values.push(c.clone());
+                    } else if let Some(Value::Array(enums)) = v.get("enum") {
+                        enum_values.extend(enums.clone());
+                    }
+                }
+                // Deduplicate
+                enum_values.sort_by_key(|a| a.to_string());
+                enum_values.dedup();
+
+                map.insert("type".to_string(), json!("string"));
+                map.insert("enum".to_string(), Value::Array(enum_values));
+            } else {
+                // Check for mixed types (Strings AND Objects)
+                // This happens in Rust enums with both Unit and Struct variants
+                let has_objects = variants
+                    .iter()
+                    .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("object"));
+                let has_strings = variants
+                    .iter()
+                    .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("string"));
+
+                if has_objects && has_strings {
+                    // CASE 2: Mixed Enum (e.g., SeasonalityProfileId with both "Flat" and { "Custom": ... })
+                    // We cannot flatten this into a single object.
+                    // Preserve as `anyOf` and let Gemini handle it (supported in newer models).
+                    let mut cleaned_variants: Vec<Value> = Vec::new();
+                    for mut variant in variants {
+                        clean_schema_node(&mut variant);
+                        cleaned_variants.push(variant);
+                    }
+                    map.insert("anyOf".to_string(), Value::Array(cleaned_variants));
+
+                    // Remove specific type constraints from the parent if they exist
+                    // because the child can be either string OR object.
+                    map.remove("type");
+                } else {
+                    // CASE 3: Complex Object Union
+                    // Proceed with existing flattening logic
+                    flatten_variants(map, variants);
+                }
+            }
         }
+
+        // Remove const at the top level (we've already extracted values from variants above)
+        map.remove("const");
 
         // Get the type to determine which properties to keep
         let schema_type = get_schema_type(map).map(|s| s.to_string());
@@ -559,5 +615,114 @@ mod tests {
 
         assert!(!schema_json.contains("\"$ref\""));
         assert!(!schema_json.contains("\"components\""));
+    }
+
+    // Pure string enum - should be converted to { "type": "string", "enum": [...] }
+    #[derive(JsonSchema)]
+    enum AccountType {
+        Revenue,
+        CostOfSales,
+        Expense,
+        Asset,
+        Liability,
+    }
+
+    #[test]
+    fn pure_string_enum_converts_to_string_with_enum() {
+        let schema = AccountType::gemini_schema();
+
+        // Should be type: "string" with enum values
+        assert_eq!(schema.get("type"), Some(&json!("string")));
+
+        let enum_values = schema
+            .get("enum")
+            .and_then(|e| e.as_array())
+            .expect("enum should exist and be an array");
+
+        // All variants should be present
+        assert!(enum_values.contains(&json!("Revenue")));
+        assert!(enum_values.contains(&json!("CostOfSales")));
+        assert!(enum_values.contains(&json!("Expense")));
+        assert!(enum_values.contains(&json!("Asset")));
+        assert!(enum_values.contains(&json!("Liability")));
+
+        // Should NOT have object properties (the old broken behavior)
+        assert!(schema.get("properties").is_none());
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("anyOf").is_none());
+    }
+
+    // Mixed enum with both unit variants and struct variants
+    #[derive(JsonSchema)]
+    enum SeasonalityProfileId {
+        Flat,
+        Custom { values: Vec<f64> },
+    }
+
+    #[test]
+    fn mixed_enum_preserves_anyof() {
+        let schema = SeasonalityProfileId::gemini_schema();
+
+        // Should have anyOf preserved (not flattened)
+        let any_of = schema
+            .get("anyOf")
+            .and_then(|a| a.as_array())
+            .expect("anyOf should exist and be an array");
+
+        // Should have 2 variants
+        assert_eq!(any_of.len(), 2);
+
+        // Check that we have both string and object variants
+        let has_string_variant = any_of
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("string"));
+        let has_object_variant = any_of
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("object"));
+
+        assert!(has_string_variant, "Should have a string variant");
+        assert!(has_object_variant, "Should have an object variant");
+
+        // Parent should NOT have type (since it could be string or object)
+        assert!(schema.get("type").is_none());
+    }
+
+    // Complex object enum - should still flatten
+    #[derive(JsonSchema)]
+    enum Message {
+        Request { id: u32, payload: String },
+        Response { id: u32, result: String },
+    }
+
+    #[test]
+    fn complex_object_enum_flattens() {
+        let schema = Message::gemini_schema();
+
+        // Should be flattened to an object
+        assert_eq!(schema.get("type"), Some(&json!("object")));
+
+        // Schemars uses externally-tagged format by default:
+        // Each variant name becomes a property with its fields as nested object
+        let properties = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("properties should exist");
+
+        // Variant names should be properties
+        assert!(properties.contains_key("Request"));
+        assert!(properties.contains_key("Response"));
+
+        // Each variant should have its nested properties
+        let request_props = properties
+            .get("Request")
+            .and_then(|r| r.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("Request properties should exist");
+        assert!(request_props.contains_key("id"));
+        assert!(request_props.contains_key("payload"));
+
+        // Should NOT have anyOf (should be flattened)
+        assert!(schema.get("anyOf").is_none());
+        assert!(schema.get("oneOf").is_none());
     }
 }
