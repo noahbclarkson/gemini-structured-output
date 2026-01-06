@@ -368,7 +368,10 @@ fn clean_schema_node(value: &mut Value) {
         // Properties only valid for specific types
         match schema_type.as_deref() {
             Some("object") => {
-                // Object types support: properties, required, additionalProperties
+                // Object types support: properties, required
+                // Note: additionalProperties is documented as supported but causes errors
+                // in practice (especially within anyOf variants), so we remove it
+                map.remove("additionalProperties");
                 // Remove string-specific properties
                 map.remove("pattern");
                 map.remove("minLength");
@@ -462,10 +465,7 @@ fn clean_schema_node(value: &mut Value) {
             }
             _ => {
                 // Unknown or missing type - be conservative and remove most things
-                // but keep additionalProperties if it looks like an object schema
-                if !map.contains_key("properties") {
-                    map.remove("additionalProperties");
-                }
+                map.remove("additionalProperties");
                 map.remove("pattern");
                 map.remove("minLength");
                 map.remove("maxLength");
@@ -482,8 +482,8 @@ fn clean_schema_node(value: &mut Value) {
                         clean_schema_node(sub_schema);
                     }
                 }
-            } else if key == "items" || key == "additionalProperties" {
-                // These can be schemas themselves
+            } else if key == "items" {
+                // items can be a schema itself
                 clean_schema_node(v);
             } else if key == "prefixItems" {
                 if let Value::Array(arr) = v {
