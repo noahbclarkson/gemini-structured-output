@@ -535,6 +535,25 @@ fn clean_schema_node(value: &mut Value) {
                 map.remove("properties");
             }
         }
+
+        // GENERAL CLEANUP FOR EMPTY OBJECTS
+        // If we have type: object but NO properties (e.g. unit variants like "LastValue": {}),
+        // Gemini API throws "properties should be non-empty".
+        // Remove "type": "object" to relax the constraint for these nodes.
+        if get_schema_type(map) == Some("object") {
+            let has_properties = map
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|p| !p.is_empty())
+                .unwrap_or(false);
+
+            if !has_properties {
+                map.remove("type");
+                map.remove("required");
+                map.remove("properties");
+                map.remove("additionalProperties");
+            }
+        }
     } else if let Value::Array(arr) = value {
         for v in arr {
             clean_schema_node(v);
