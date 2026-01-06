@@ -16,13 +16,13 @@ evals = []
 macros = ["dep:gemini-structured-macros"]
 
 [dependencies]
-gemini-rust = { git = "https://github.com/noahbclarkson/gemini-rust", branch = "file-handle-feature" }
+gemini-rust = { git = "https://github.com/flachesis/gemini-rust" }
 gemini-structured-macros = { path = "./gemini-structured-macros", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-schemars = { version = "1.1", features = ["chrono04", "preserve_order"] }
+schemars = { version = "1.2", features = ["chrono04", "preserve_order"] }
 json-patch = "4.1"
-jsonschema = "0.37.4"
+jsonschema = "0.38.1"
 thiserror = "2.0.17"
 async-trait = "0.1.89"
 futures = "0.3"
