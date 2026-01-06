@@ -403,15 +403,21 @@ impl RefinementEngine {
                                 if structured.is_retryable()
                                     && net_try < self.config.network_retries
                                 {
-                                    let delay_ms = 200 * 2_u64.pow(net_try as u32);
+                                    // Use API-provided retry delay if available, otherwise exponential backoff
+                                    let delay = structured
+                                        .retry_delay()
+                                        .map(Duration::from_secs)
+                                        .unwrap_or_else(|| {
+                                            Duration::from_millis(200 * 2_u64.pow(net_try as u32))
+                                        });
                                     warn!(
                                         attempt = attempt_idx,
                                         network_try = net_try + 1,
-                                        "Transient error ({}). Retrying after {}ms",
+                                        "Transient error ({}). Retrying after {:?}",
                                         structured,
-                                        delay_ms
+                                        delay
                                     );
-                                    sleep(Duration::from_millis(delay_ms)).await;
+                                    sleep(delay).await;
                                     last_err = Some(structured);
                                     continue;
                                 } else {

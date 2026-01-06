@@ -134,10 +134,64 @@ impl StructuredError {
         match self {
             Self::RateLimited { retry_after_secs } => Some(*retry_after_secs),
             Self::ServiceUnavailable { .. } => Some(5),
+            Self::Gemini(gemini_rust::ClientError::BadResponse {
+                code: 429,
+                description,
+            }) => description
+                .as_ref()
+                .and_then(|d| parse_retry_delay_from_error(d)),
             _ => None,
         }
     }
+}
 
+/// Parse retry delay from Gemini API error response body.
+/// Looks for `"retryDelay": "44s"` or similar patterns.
+fn parse_retry_delay_from_error(description: &str) -> Option<u64> {
+    // Try to parse as JSON and find retryDelay in details
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(description) {
+        if let Some(details) = json.get("error").and_then(|e| e.get("details")) {
+            if let Some(arr) = details.as_array() {
+                for detail in arr {
+                    if detail.get("@type").and_then(|t| t.as_str())
+                        == Some("type.googleapis.com/google.rpc.RetryInfo")
+                    {
+                        if let Some(delay_str) = detail.get("retryDelay").and_then(|d| d.as_str()) {
+                            return parse_duration_string(delay_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: regex-like pattern match for "retry in X.Xs" or "retryDelay": "Xs"
+    let lower = description.to_lowercase();
+    if let Some(idx) = lower.find("retry in ") {
+        let start = idx + "retry in ".len();
+        if let Some(end) = lower[start..].find('s') {
+            if let Ok(secs) = lower[start..start + end].trim().parse::<f64>() {
+                return Some(secs.ceil() as u64);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse duration strings like "44s", "44.5s".
+fn parse_duration_string(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.ends_with('s') {
+        let num_part = s.trim_end_matches('s');
+        if let Ok(secs) = num_part.parse::<f64>() {
+            return Some(secs.ceil() as u64);
+        }
+    }
+    None
+}
+
+impl StructuredError {
     fn suggest_parse_fix(err: &serde_json::Error, raw_text: &str) -> String {
         let err_msg = err.to_string().to_lowercase();
 

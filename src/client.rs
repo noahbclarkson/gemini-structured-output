@@ -498,6 +498,24 @@ impl StructuredClient {
         generation_config: Option<GenerationConfig>,
     ) -> Result<serde_json::Value> {
         let (system_instruction, contents) = ctx.build();
+
+        // Handle mock responses
+        if let Some(mock) = &self.mock_handler {
+            let preview = contents
+                .iter()
+                .map(|c| format!("{c:?}"))
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            let request = MockRequest {
+                target: std::any::type_name::<serde_json::Value>().to_string(),
+                system_instruction: system_instruction.clone(),
+                prompt_preview: preview,
+            };
+            let raw = (mock)(request)?;
+            return serde_json::from_str(&raw)
+                .map_err(|e| StructuredError::parse_error(e, &raw));
+        }
+
         let mut messages = Vec::new();
         for content in contents {
             let role = content.role.clone().unwrap_or(Role::User);

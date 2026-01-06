@@ -335,15 +335,20 @@ where
                     Err(e @ gemini_rust::ClientError::BadResponse { code, .. })
                         if code == 503 || code == 429 =>
                     {
+                        let structured_err = StructuredError::Gemini(e);
+                        // Use API-provided retry delay if available, otherwise exponential backoff
+                        let delay_secs = structured_err
+                            .retry_delay()
+                            .unwrap_or_else(|| 2u64.pow(attempt as u32));
                         warn!(
-                            "Attempt {}/{} failed with status {}. Retrying...",
+                            "Attempt {}/{} failed with status {}. Retrying in {}s...",
                             attempt + 1,
                             self.retry_count + 1,
-                            code
+                            code,
+                            delay_secs
                         );
-                        // Capture the last transient error so we can surface it if retries are exhausted.
-                        last_error = Some(StructuredError::Gemini(e));
-                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt as u32))).await;
+                        last_error = Some(structured_err);
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                     }
                     Err(e) => {
                         last_error = Some(StructuredError::Gemini(e));
