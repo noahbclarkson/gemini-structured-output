@@ -369,9 +369,7 @@ fn clean_schema_node(value: &mut Value) {
         match schema_type.as_deref() {
             Some("object") => {
                 // Object types support: properties, required
-                // Note: additionalProperties is documented as supported but causes errors
-                // in practice (especially within anyOf variants), so we remove it
-                map.remove("additionalProperties");
+                // Note: additionalProperties is handled specially below for HashMap transformation
                 // Remove string-specific properties
                 map.remove("pattern");
                 map.remove("minLength");
@@ -496,10 +494,86 @@ fn clean_schema_node(value: &mut Value) {
                 clean_schema_node(v);
             }
         }
+
+        // SPECIAL HANDLING FOR HASHMAPS (additionalProperties)
+        // Gemini rejects additionalProperties. We transform this pattern:
+        // { "type": "object", "additionalProperties": { ...value_schema... } }
+        // INTO:
+        // { "type": "array", "items": { "type": "object", "properties": { "__key__": { "type": "string" }, "__value__": { ...value_schema... } }, "required": ["__key__", "__value__"] } }
+        if let Some(mut add_props) = map.remove("additionalProperties") {
+            // Only transform if it's a map schema (no specific properties defined)
+            let has_specific_props = map
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .is_some_and(|o| !o.is_empty());
+
+            if !has_specific_props && add_props.is_object() {
+                // Ensure the inner schema is cleaned *before* wrapping it
+                clean_schema_node(&mut add_props);
+
+                map.insert("type".to_string(), json!("array"));
+                map.insert(
+                    "items".to_string(),
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "__key__": { "type": "string" },
+                            "__value__": add_props
+                        },
+                        "required": ["__key__", "__value__"]
+                    }),
+                );
+                // Remove object-specific fields that might linger
+                map.remove("required");
+                map.remove("properties");
+            }
+        }
     } else if let Value::Array(arr) = value {
         for v in arr {
             clean_schema_node(v);
         }
+    }
+}
+
+/// Recursively normalizes the JSON response from Gemini.
+/// Converts Arrays of {__key__, __value__} back into Objects { key: value }.
+pub fn normalize_json_response(value: &mut Value) {
+    match value {
+        Value::Array(arr) => {
+            // Check if this array looks like a transformed Map
+            let is_kv_map = !arr.is_empty()
+                && arr.iter().all(|item| {
+                    item.as_object()
+                        .is_some_and(|o| o.contains_key("__key__") && o.contains_key("__value__"))
+                });
+
+            if is_kv_map {
+                let mut map = Map::new();
+                for item in arr.drain(..) {
+                    if let Value::Object(mut obj) = item {
+                        if let (Some(Value::String(key)), Some(mut val)) =
+                            (obj.remove("__key__"), obj.remove("__value__"))
+                        {
+                            // Recurse into value before inserting
+                            normalize_json_response(&mut val);
+                            map.insert(key, val);
+                        }
+                    }
+                }
+                *value = Value::Object(map);
+            } else {
+                // Normal array, recurse
+                for item in arr {
+                    normalize_json_response(item);
+                }
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                normalize_json_response(v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -589,17 +663,93 @@ mod tests {
     }
 
     #[test]
-    fn map_schemas_strip_additional_properties() {
+    fn map_schemas_transform_to_array() {
         let schema = MapWrapper::gemini_schema();
         let map_schema = schema
             .get("properties")
             .and_then(|p| p.get("map"))
             .expect("map schema should exist");
 
-        // additionalProperties is stripped because Gemini rejects it in practice
-        // (especially within anyOf variants), despite documentation claiming support
-        assert_eq!(map_schema.get("type"), Some(&json!("object")));
+        // HashMap schemas are transformed to arrays with __key__/__value__ items
+        assert_eq!(map_schema.get("type"), Some(&json!("array")));
         assert!(map_schema.get("additionalProperties").is_none());
+
+        // Check the items schema
+        let items_schema = map_schema
+            .get("items")
+            .expect("items schema should exist");
+        assert_eq!(items_schema.get("type"), Some(&json!("object")));
+
+        let item_props = items_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("items should have properties");
+        assert!(item_props.contains_key("__key__"));
+        assert!(item_props.contains_key("__value__"));
+
+        // Check required fields
+        let required = items_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("items should have required");
+        assert!(required.contains(&json!("__key__")));
+        assert!(required.contains(&json!("__value__")));
+    }
+
+    #[test]
+    fn normalize_json_response_converts_kv_arrays_to_objects() {
+        let mut response = json!({
+            "map": [
+                { "__key__": "a", "__value__": "1" },
+                { "__key__": "b", "__value__": "2" }
+            ]
+        });
+
+        normalize_json_response(&mut response);
+
+        let map = response.get("map").expect("map should exist");
+        assert!(map.is_object());
+        assert_eq!(map.get("a"), Some(&json!("1")));
+        assert_eq!(map.get("b"), Some(&json!("2")));
+    }
+
+    #[test]
+    fn normalize_json_response_handles_nested_maps() {
+        let mut response = json!({
+            "outer": [
+                {
+                    "__key__": "x",
+                    "__value__": [
+                        { "__key__": "inner1", "__value__": 10 },
+                        { "__key__": "inner2", "__value__": 20 }
+                    ]
+                }
+            ]
+        });
+
+        normalize_json_response(&mut response);
+
+        let outer = response.get("outer").expect("outer should exist");
+        assert!(outer.is_object());
+        let x = outer.get("x").expect("x should exist");
+        assert!(x.is_object());
+        assert_eq!(x.get("inner1"), Some(&json!(10)));
+        assert_eq!(x.get("inner2"), Some(&json!(20)));
+    }
+
+    #[test]
+    fn normalize_json_response_leaves_regular_arrays_alone() {
+        let mut response = json!({
+            "items": [
+                { "id": 1, "name": "foo" },
+                { "id": 2, "name": "bar" }
+            ]
+        });
+
+        let expected = response.clone();
+        normalize_json_response(&mut response);
+
+        assert_eq!(response, expected);
     }
 
     #[derive(JsonSchema)]

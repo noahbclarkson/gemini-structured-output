@@ -459,18 +459,28 @@ Enable the `helpers` feature for utilities that format data for LLM consumption.
 
 ## Advanced Topics
 
-### Custom Adapters
+### Automatic HashMap Support
 
-Sometimes LLMs struggle with Rust-specific types like `HashMap` or `Duration`. We provide adapters to serialize these into LLM-friendly formats (e.g., list of Key-Value pairs).
+`HashMap` types are automatically handled by transforming the schema to use arrays of `{__key__, __value__}` pairs (which Gemini's strict mode accepts), then normalizing the response back into proper objects before deserialization. No annotations are needed:
 
 ```rust
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct Config {
-    // Serializes as [{key: "...", value: ...}] for the LLM
-    // Deserializes back into HashMap for Rust
-    #[serde(with = "gemini_structured_output::adapter::map")]
-    #[schemars(with = "Vec<KeyValue<String, f64>>")]
+    // HashMaps work automatically - no adapter needed!
     pub settings: HashMap<String, f64>,
+}
+```
+
+### Custom Adapters
+
+For other Rust-specific types like `Duration` or `Vec<u8>`, we provide adapters to serialize them into LLM-friendly formats:
+
+```rust
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct Task {
+    // Serializes Duration as seconds (f64) for the LLM
+    #[serde(with = "gemini_structured_output::adapter::duration_secs")]
+    pub timeout: Duration,
 }
 ```
 

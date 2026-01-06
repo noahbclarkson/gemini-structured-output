@@ -53,7 +53,6 @@ pub mod session;
 pub mod tools;
 pub mod workflow;
 
-pub use adapter::KeyValue;
 pub use caching::CachePolicy;
 pub use caching::CacheSettings;
 pub use client::{
@@ -91,7 +90,6 @@ pub use workflow::{
 /// use gemini_structured_output::prelude::*;
 /// ```
 pub mod prelude {
-    pub use crate::adapter::KeyValue;
     pub use crate::caching::{CachePolicy, CacheSettings};
     pub use crate::client::{
         FallbackStrategy, MockHandler, MockRequest, StructuredClient, StructuredClientBuilder,

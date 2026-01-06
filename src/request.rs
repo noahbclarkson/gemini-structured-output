@@ -394,68 +394,86 @@ where
                     trace!(cleaned_response = %cleaned_text, "Cleaned JSON text");
                 }
 
-                match serde_json::from_str::<T>(&cleaned_text) {
-                    Ok(parsed) => {
-                        debug!("Successfully parsed structured response");
-                        if let Some(instruction) = &self.refinement_instruction {
-                            debug!("Starting refinement step");
-                            let refinement = self
-                                .client
-                                .refine(parsed, instruction.clone())
-                                .execute()
-                                .await?;
-                            return Ok(GenerationOutcome::new(
-                                refinement.value,
-                                response.usage_metadata,
-                                function_calls,
-                                response.model_version,
-                                response.response_id,
-                                parse_attempts,
-                                total_network_attempts,
-                            ));
-                        }
+                // Parse to Value first, normalize maps (Array<__key__, __value__> -> Object), then deserialize to T
+                match serde_json::from_str::<Value>(&cleaned_text) {
+                    Ok(mut json_value) => {
+                        // Apply normalization for HashMap schemas that were transformed to arrays
+                        crate::schema::normalize_json_response(&mut json_value);
 
-                        return Ok(GenerationOutcome::new(
-                            parsed,
-                            response.usage_metadata,
-                            function_calls,
-                            response.model_version,
-                            response.response_id,
-                            parse_attempts,
-                            total_network_attempts,
-                        ));
+                        match serde_json::from_value::<T>(json_value) {
+                            Ok(parsed) => {
+                                debug!("Successfully parsed structured response");
+                                if let Some(instruction) = &self.refinement_instruction {
+                                    debug!("Starting refinement step");
+                                    let refinement = self
+                                        .client
+                                        .refine(parsed, instruction.clone())
+                                        .execute()
+                                        .await?;
+                                    return Ok(GenerationOutcome::new(
+                                        refinement.value,
+                                        response.usage_metadata,
+                                        function_calls,
+                                        response.model_version,
+                                        response.response_id,
+                                        parse_attempts,
+                                        total_network_attempts,
+                                    ));
+                                }
+
+                                return Ok(GenerationOutcome::new(
+                                    parsed,
+                                    response.usage_metadata,
+                                    function_calls,
+                                    response.model_version,
+                                    response.response_id,
+                                    parse_attempts,
+                                    total_network_attempts,
+                                ));
+                            }
+                            Err(err) => {
+                                let validation_hint = validation_errors_for::<T>(&serde_json::from_str::<Value>(&cleaned_text).unwrap_or_default());
+                                warn!(
+                                    error = %err,
+                                    raw_response = %text,
+                                    cleaned_response = %cleaned_text,
+                                    validation = ?validation_hint,
+                                    "JSON parsing failed"
+                                );
+                                parse_attempts += 1;
+                                if parse_attempts >= self.max_parse_attempts {
+                                    let base = format!(
+                                        "Failed to parse JSON after {} attempts: {err}",
+                                        self.max_parse_attempts
+                                    );
+                                    if let Some(hint) = validation_hint {
+                                        return Err(StructuredError::Validation(format!(
+                                            "{base}; validation issues: {hint}; raw: {text}"
+                                        )));
+                                    }
+                                    return Err(StructuredError::parse_error(err, &text));
+                                }
+                                let mut retry_msg = format!(
+                                    "Failed to parse JSON: {err}. Return ONLY valid JSON matching the schema."
+                                );
+                                if let Some(hint) = validation_hint {
+                                    retry_msg.push_str(&format!(" Validation issues: {hint}"));
+                                }
+                                messages.push(Message::user(retry_msg));
+                                continue;
+                            }
+                        }
                     }
                     Err(err) => {
-                        let validation_hint = serde_json::from_str::<Value>(&cleaned_text)
-                            .ok()
-                            .and_then(|value| validation_errors_for::<T>(&value));
-                        warn!(
-                            error = %err,
-                            raw_response = %text,
-                            cleaned_response = %cleaned_text,
-                            validation = ?validation_hint,
-                            "JSON parsing failed"
-                        );
+                        // JSON syntax error in the raw text itself
+                        warn!(error = %err, raw_response = %text, "Failed to parse raw JSON syntax");
                         parse_attempts += 1;
                         if parse_attempts >= self.max_parse_attempts {
-                            let base = format!(
-                                "Failed to parse JSON after {} attempts: {err}",
-                                self.max_parse_attempts
-                            );
-                            if let Some(hint) = validation_hint {
-                                return Err(StructuredError::Validation(format!(
-                                    "{base}; validation issues: {hint}; raw: {text}"
-                                )));
-                            }
                             return Err(StructuredError::parse_error(err, &text));
                         }
-                        let mut retry_msg = format!(
+                        messages.push(Message::user(format!(
                             "Failed to parse JSON: {err}. Return ONLY valid JSON matching the schema."
-                        );
-                        if let Some(hint) = validation_hint {
-                            retry_msg.push_str(&format!(" Validation issues: {hint}"));
-                        }
-                        messages.push(Message::user(retry_msg));
+                        )));
                         continue;
                     }
                 }
@@ -601,7 +619,10 @@ where
                 }
 
                 let cleaned = clean_json_text(&state.buffer);
-                let parsed: T = serde_json::from_str(&cleaned)
+                let mut json_value: Value = serde_json::from_str(&cleaned)
+                    .map_err(|e| StructuredError::parse_error(e, &cleaned))?;
+                crate::schema::normalize_json_response(&mut json_value);
+                let parsed: T = serde_json::from_value(json_value)
                     .map_err(|e| StructuredError::parse_error(e, &cleaned))?;
 
                 if let Some(instr) = &state.refinement_instruction {

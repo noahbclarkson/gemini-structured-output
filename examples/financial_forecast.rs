@@ -1,12 +1,12 @@
 //! Financial Forecast Example
 //!
-//! This example demonstrates supporting `HashMap` structured output via the
-//! adapter pattern (map ↔ list of key/value objects) and then refining it.
+//! This example demonstrates supporting `HashMap` structured output with automatic
+//! schema transformation and response normalization, then refining it.
 
 use futures::StreamExt;
 use gemini_rust::{GenerationConfig, Model};
 use gemini_structured_output::{
-    adapter::KeyValue, ArrayPatchStrategy, GeminiStructured, StreamEvent, StructuredClientBuilder,
+    ArrayPatchStrategy, GeminiStructured, StreamEvent, StructuredClientBuilder,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -42,14 +42,10 @@ pub struct Account {
     pub category: String,
     /// Historical values by period (e.g., {"2023-Q1": 100000, "2023-Q2": 105000})
     ///
-    /// The adapter treats the map as a list of `{key, value}` pairs for the LLM,
-    /// then deserializes it back into a `HashMap`.
-    #[serde(with = "gemini_structured_output::adapter::map")]
-    #[schemars(with = "Vec<KeyValue<String, f64>>")]
+    /// HashMap schemas are automatically transformed to arrays of {__key__, __value__}
+    /// for Gemini, then normalized back to objects in the response.
     pub historical: HashMap<String, f64>,
     /// Forecast values by period
-    #[serde(with = "gemini_structured_output::adapter::map")]
-    #[schemars(with = "Vec<KeyValue<String, f64>>")]
     pub forecast: HashMap<String, f64>,
     /// Configuration for forecasting this account
     pub forecast_config: ForecastConfig,
