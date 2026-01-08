@@ -388,21 +388,24 @@ fn clean_schema_node(value: &mut Value) {
         }
 
         // Handle oneOf/anyOf intelligently based on variant types
-        if let Some(Value::Array(variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf")) {
-            // Check if this is a simple string enum (e.g., Rust unit variants)
+        if let Some(Value::Array(mut variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf"))
+        {
+            // Check if this is a simple string enum FIRST (before cleaning removes const).
             // Schemars generates these as: { "type": "string", "const": "Value" }
             let is_pure_string_enum = variants.iter().all(|v| {
                 let is_string = v.get("type").and_then(|t| t.as_str()) == Some("string");
                 let has_const_string = v.get("const").and_then(|c| c.as_str()).is_some();
                 let has_enum = v.get("enum").is_some();
-                (is_string || has_const_string || has_enum) && (v.get("const").is_some() || has_enum)
+                (is_string || has_const_string || has_enum)
+                    && (v.get("const").is_some() || has_enum)
             });
 
             if is_pure_string_enum {
                 // CASE 1: Pure String Enum (e.g., AccountType)
                 // Convert to { "type": "string", "enum": ["A", "B"] }
+                // No need to clean variants - we're just extracting const/enum values.
                 let mut enum_values = Vec::new();
-                for v in variants {
+                for v in &variants {
                     if let Some(c) = v.get("const") {
                         enum_values.push(c.clone());
                     } else if let Some(Value::Array(enums)) = v.get("enum") {
@@ -416,6 +419,14 @@ fn clean_schema_node(value: &mut Value) {
                 map.insert("type".to_string(), json!("string"));
                 map.insert("enum".to_string(), Value::Array(enum_values));
             } else {
+                // CRITICAL: Recursively clean all variants BEFORE flattening/detection.
+                // This ensures 'allOf' inside variants is merged, exposing 'properties'
+                // so that object detection and flattening work correctly.
+                // Without this, variants wrapped in allOf would appear empty.
+                for variant in &mut variants {
+                    clean_schema_node(variant);
+                }
+
                 // Check for mixed types (Strings AND Objects)
                 // This happens in Rust enums with both Unit and Struct variants
                 let has_objects = variants.iter().any(|v| {
@@ -424,19 +435,15 @@ fn clean_schema_node(value: &mut Value) {
                 });
                 let has_strings = variants.iter().any(|v| {
                     v.get("type").and_then(|t| t.as_str()) == Some("string")
-                        || v.get("const").and_then(|c| c.as_str()).is_some()
+                        || v.get("enum").is_some() // After cleaning, const becomes enum
                 });
 
                 if has_objects && has_strings {
                     // CASE 2: Mixed Enum (e.g., SeasonalityProfileId with both "Flat" and { "Custom": ... })
                     // We cannot flatten this into a single object.
                     // Preserve as `anyOf` and let Gemini handle it (supported in newer models).
-                    let mut cleaned_variants: Vec<Value> = Vec::new();
-                    for mut variant in variants {
-                        clean_schema_node(&mut variant);
-                        cleaned_variants.push(variant);
-                    }
-                    map.insert("anyOf".to_string(), Value::Array(cleaned_variants));
+                    // Variants are already cleaned above.
+                    map.insert("anyOf".to_string(), Value::Array(variants));
 
                     // Remove specific type constraints from the parent if they exist
                     // because the child can be either string OR object.
@@ -446,7 +453,8 @@ fn clean_schema_node(value: &mut Value) {
                     map.remove("enum");
                 } else {
                     // CASE 3: Complex Object Union
-                    // Proceed with existing flattening logic
+                    // Proceed with existing flattening logic.
+                    // Variants are already cleaned above.
                     flatten_variants(map, variants);
                 }
             }
@@ -1449,6 +1457,141 @@ mod tests {
         assert!(
             processor.get("type").is_some() || processor.get("properties").is_some(),
             "processor should have content after processing, got: {}",
+            serde_json::to_string_pretty(processor).unwrap()
+        );
+    }
+
+    /// Test that oneOf variants wrapped in allOf are properly cleaned before flattening.
+    /// This is the key fix: schemars may wrap each variant in allOf to add descriptions,
+    /// hiding the properties from the flattening logic.
+    #[test]
+    fn oneof_variants_with_allof_wrappers_cleaned_before_flatten() {
+        // This simulates schemars output where each variant in a oneOf is wrapped in allOf
+        // to attach a description to each variant.
+        let mut schema = json!({
+            "oneOf": [
+                {
+                    "description": "Model-based processor",
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "model": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": { "type": "string", "enum": ["mstl"] }
+                                    },
+                                    "required": ["type"]
+                                }
+                            },
+                            "required": ["model"]
+                        }
+                    ]
+                },
+                {
+                    "description": "Custom processor",
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "custom": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" }
+                                    },
+                                    "required": ["name"]
+                                }
+                            },
+                            "required": ["custom"]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        // Should be flattened to an object with both variant properties
+        assert_eq!(
+            schema.get("type"),
+            Some(&json!("object")),
+            "should be flattened to object type"
+        );
+
+        let properties = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("should have properties after flattening");
+
+        // Both variants' properties should be present
+        assert!(
+            properties.contains_key("model"),
+            "should have 'model' property from first variant"
+        );
+        assert!(
+            properties.contains_key("custom"),
+            "should have 'custom' property from second variant"
+        );
+
+        // allOf should be completely removed
+        assert!(schema.get("allOf").is_none());
+        assert!(schema.get("oneOf").is_none());
+    }
+
+    /// Test deeply nested allOf inside oneOf variants
+    #[test]
+    fn deeply_nested_allof_in_oneof_variants() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "processor": {
+                    "description": "The processor configuration",
+                    "allOf": [
+                        {
+                            "oneOf": [
+                                {
+                                    "description": "MSTL variant",
+                                    "allOf": [
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "model": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "type": { "type": "string", "const": "mstl" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        let processor = schema
+            .get("properties")
+            .and_then(|p| p.get("processor"))
+            .expect("processor should exist");
+
+        // All allOf should be merged
+        assert!(processor.get("allOf").is_none(), "allOf should be removed");
+
+        // Description from outer allOf should be preserved
+        assert_eq!(
+            processor.get("description"),
+            Some(&json!("The processor configuration"))
+        );
+
+        // Should have the flattened structure
+        assert!(
+            processor.get("type").is_some() || processor.get("properties").is_some(),
+            "processor should have content, got: {}",
             serde_json::to_string_pretty(processor).unwrap()
         );
     }
