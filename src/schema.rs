@@ -1197,4 +1197,259 @@ mod tests {
         assert_eq!(schema.get("nullable"), Some(&json!(true)));
         assert_eq!(schema.get("description"), Some(&json!("A nullable field")));
     }
+
+    /// Test that allOf containing oneOf (enum with description) is properly merged.
+    /// This is the pattern schemars generates when a field has a description and is an enum type.
+    /// Example: { "description": "The processor to use", "allOf": [{ "oneOf": [...] }] }
+    #[test]
+    fn allof_containing_oneof_merges_correctly() {
+        // Simulate the pattern: a processor field that's an enum, wrapped in allOf with description
+        let mut schema = json!({
+            "description": "The processor to use",
+            "allOf": [
+                {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "model": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": { "type": "string", "enum": ["mstl", "arima"] }
+                                    },
+                                    "required": ["type"]
+                                }
+                            },
+                            "required": ["model"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "custom": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" }
+                                    },
+                                    "required": ["name"]
+                                }
+                            },
+                            "required": ["custom"]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        // allOf should be removed
+        assert!(
+            schema.get("allOf").is_none(),
+            "allOf should be removed after merge"
+        );
+
+        // Description should be preserved
+        assert_eq!(
+            schema.get("description"),
+            Some(&json!("The processor to use")),
+            "description should be preserved"
+        );
+
+        // The schema should NOT be empty - it should have type and properties from flattened oneOf
+        // After oneOf flattening for object variants, we should have type: "object" and properties
+        assert!(
+            schema.get("type").is_some() || schema.get("properties").is_some(),
+            "schema should have type or properties after oneOf merge, got: {}",
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
+
+        // Should have properties (flattened from oneOf variants)
+        let properties = schema.get("properties").and_then(|p| p.as_object());
+        assert!(
+            properties.is_some(),
+            "should have properties after flattening oneOf, got: {}",
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
+
+        let props = properties.unwrap();
+        assert!(
+            props.contains_key("model") || props.contains_key("custom"),
+            "should have model or custom property, got: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Test allOf containing a pure string enum (oneOf with const values)
+    #[test]
+    fn allof_containing_string_enum_merges_correctly() {
+        let mut schema = json!({
+            "description": "The account type",
+            "allOf": [
+                {
+                    "oneOf": [
+                        { "type": "string", "const": "Revenue" },
+                        { "type": "string", "const": "Expense" },
+                        { "type": "string", "const": "Asset" }
+                    ]
+                }
+            ]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        // allOf should be removed
+        assert!(schema.get("allOf").is_none());
+
+        // Description should be preserved
+        assert_eq!(
+            schema.get("description"),
+            Some(&json!("The account type"))
+        );
+
+        // Should be converted to string enum
+        assert_eq!(
+            schema.get("type"),
+            Some(&json!("string")),
+            "should be string type"
+        );
+
+        let enum_values = schema
+            .get("enum")
+            .and_then(|e| e.as_array())
+            .expect("should have enum values");
+
+        assert!(enum_values.contains(&json!("Revenue")));
+        assert!(enum_values.contains(&json!("Expense")));
+        assert!(enum_values.contains(&json!("Asset")));
+    }
+
+    /// Test that a nested property with allOf + oneOf is properly handled
+    /// This simulates the real-world case where a `processor` field inside a config struct
+    /// has an enum type with a description.
+    #[test]
+    fn nested_property_with_allof_oneof_merges_correctly() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "processor": {
+                    "description": "The processor to use",
+                    "allOf": [
+                        {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "model": {
+                                            "type": "object",
+                                            "properties": {
+                                                "type": { "type": "string", "enum": ["mstl"] }
+                                            },
+                                            "required": ["type"]
+                                        }
+                                    },
+                                    "required": ["model"]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            "required": ["name", "processor"]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        // Get the processor property
+        let processor = schema
+            .get("properties")
+            .and_then(|p| p.get("processor"))
+            .expect("processor property should exist");
+
+        // allOf should be removed from processor
+        assert!(
+            processor.get("allOf").is_none(),
+            "allOf should be removed from processor"
+        );
+
+        // Description should be preserved
+        assert_eq!(
+            processor.get("description"),
+            Some(&json!("The processor to use")),
+            "description should be preserved"
+        );
+
+        // Processor should NOT be empty - it should have the flattened structure
+        assert!(
+            processor.get("type").is_some() || processor.get("properties").is_some(),
+            "processor should have type or properties, got: {}",
+            serde_json::to_string_pretty(processor).unwrap()
+        );
+    }
+
+    /// Test the complete flow: $ref inlining followed by allOf merging.
+    /// This simulates how schemars generates schemas with references.
+    #[test]
+    fn ref_inlining_then_allof_merge_works() {
+        // This is how schemars generates the schema:
+        // - The processor field has { description: "...", allOf: [{ $ref: "#/$defs/ProcessorType" }] }
+        // - ProcessorType is defined in $defs with a oneOf
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "processor": {
+                    "description": "The processor to use",
+                    "allOf": [
+                        { "$ref": "#/$defs/ProcessorType" }
+                    ]
+                }
+            },
+            "$defs": {
+                "ProcessorType": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "model": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": { "type": "string", "enum": ["mstl"] }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        // This is the same function called by gemini_schema()
+        clean_schema_for_gemini(&mut schema);
+
+        // $defs should be removed
+        assert!(schema.get("$defs").is_none(), "$defs should be removed");
+
+        // Get the processor property
+        let processor = schema
+            .get("properties")
+            .and_then(|p| p.get("processor"))
+            .expect("processor property should exist");
+
+        // $ref should be inlined and allOf should be merged
+        assert!(processor.get("$ref").is_none(), "$ref should be removed");
+        assert!(processor.get("allOf").is_none(), "allOf should be removed");
+
+        // Description should be preserved
+        assert_eq!(
+            processor.get("description"),
+            Some(&json!("The processor to use"))
+        );
+
+        // The oneOf should be processed and flattened
+        assert!(
+            processor.get("type").is_some() || processor.get("properties").is_some(),
+            "processor should have content after processing, got: {}",
+            serde_json::to_string_pretty(processor).unwrap()
+        );
+    }
 }
