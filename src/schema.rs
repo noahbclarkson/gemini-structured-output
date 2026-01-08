@@ -280,6 +280,56 @@ fn flatten_variants(parent: &mut Map<String, Value>, variants: Vec<Value>) {
 /// - For arrays: items, prefixItems, minItems, maxItems
 fn clean_schema_node(value: &mut Value) {
     if let Value::Object(map) = value {
+        // Handle allOf by merging sub-schemas into the parent.
+        // This is crucial for handling schemars' pattern of using allOf to attach descriptions to refs.
+        // Example: { "description": "...", "allOf": [{"$ref": "..."}] }
+        // After ref inlining becomes: { "description": "...", "allOf": [{ "type": "object", ... }] }
+        // We merge the allOf contents into the parent to preserve the type definition.
+        if let Some(Value::Array(all_of)) = map.remove("allOf") {
+            for sub_schema in all_of {
+                if let Value::Object(sub_map) = sub_schema {
+                    for (k, v) in sub_map {
+                        match k.as_str() {
+                            "properties" => {
+                                // Merge properties: add child properties to parent
+                                let parent_props = map
+                                    .entry("properties")
+                                    .or_insert(json!({}))
+                                    .as_object_mut()
+                                    .unwrap();
+                                if let Value::Object(child_props) = v {
+                                    for (pk, pv) in child_props {
+                                        parent_props.insert(pk, pv);
+                                    }
+                                }
+                            }
+                            "required" => {
+                                // Merge required arrays, avoiding duplicates
+                                if let Value::Array(child_req) = v {
+                                    let parent_req = map
+                                        .entry("required")
+                                        .or_insert(json!([]))
+                                        .as_array_mut()
+                                        .unwrap();
+                                    for r in child_req {
+                                        if !parent_req.contains(&r) {
+                                            parent_req.push(r);
+                                        }
+                                    }
+                                }
+                            }
+                            // For other keys (type, enum, items, etc.), adopt them if missing in parent
+                            _ => {
+                                if !map.contains_key(&k) {
+                                    map.insert(k, v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Properties that are never supported by Gemini
         // Note: "const" is handled manually below during oneOf/anyOf processing
         let always_unsupported = [
@@ -294,7 +344,6 @@ fn clean_schema_node(value: &mut Value) {
             "if",
             "then",
             "else",
-            "allOf",
         ];
 
         for key in always_unsupported {
@@ -900,5 +949,147 @@ mod tests {
         // Should NOT have anyOf (should be flattened)
         assert!(schema.get("anyOf").is_none());
         assert!(schema.get("oneOf").is_none());
+    }
+
+    /// Test that allOf with description pattern is handled correctly.
+    /// schemars often generates: { "description": "...", "allOf": [{"$ref": "..."}] }
+    /// After ref inlining, the allOf contents should be merged into the parent.
+    #[test]
+    fn allof_with_description_merges_correctly() {
+        // Simulate the pattern schemars generates after ref inlining:
+        // { "description": "The processor to use", "allOf": [{ "type": "object", "properties": {...} }] }
+        let mut schema = json!({
+            "description": "The processor configuration",
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "model": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string", "enum": ["mstl", "arima"] }
+                            },
+                            "required": ["type"]
+                        }
+                    },
+                    "required": ["model"]
+                }
+            ]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        // The allOf should be removed
+        assert!(schema.get("allOf").is_none(), "allOf should be removed");
+
+        // The description from the parent should be preserved
+        assert_eq!(
+            schema.get("description"),
+            Some(&json!("The processor configuration")),
+            "description should be preserved"
+        );
+
+        // The type from the allOf sub-schema should be merged into the parent
+        assert_eq!(
+            schema.get("type"),
+            Some(&json!("object")),
+            "type should be merged from allOf"
+        );
+
+        // The properties should be merged into the parent
+        let properties = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("properties should exist after merge");
+        assert!(
+            properties.contains_key("model"),
+            "model property should be merged from allOf"
+        );
+
+        // The required array should be merged into the parent
+        let required = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("required should exist after merge");
+        assert!(
+            required.contains(&json!("model")),
+            "model should be in required"
+        );
+    }
+
+    /// Test that nested allOf structures are handled correctly
+    #[test]
+    fn nested_allof_structures_merge_correctly() {
+        // Parent has a description and allOf, where allOf sub-schema also has a description
+        let mut schema = json!({
+            "description": "Parent description",
+            "allOf": [
+                {
+                    "type": "object",
+                    "description": "Sub-schema description (should be ignored since parent has one)",
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
+                    "required": ["name"]
+                }
+            ]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        // Parent description should win (since it already existed)
+        assert_eq!(
+            schema.get("description"),
+            Some(&json!("Parent description")),
+            "parent description should be preserved"
+        );
+
+        // Type and properties should be merged
+        assert_eq!(schema.get("type"), Some(&json!("object")));
+        assert!(schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .is_some_and(|p| p.contains_key("name")));
+    }
+
+    /// Test multiple sub-schemas in allOf are all merged
+    #[test]
+    fn multiple_allof_subschemas_merge_correctly() {
+        let mut schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer" }
+                    },
+                    "required": ["id"]
+                },
+                {
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
+                    "required": ["name"]
+                }
+            ]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        assert!(schema.get("allOf").is_none());
+        assert_eq!(schema.get("type"), Some(&json!("object")));
+
+        let properties = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("properties should exist");
+        assert!(properties.contains_key("id"), "id should be merged");
+        assert!(properties.contains_key("name"), "name should be merged");
+
+        let required = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("required should exist");
+        assert!(required.contains(&json!("id")), "id should be required");
+        assert!(required.contains(&json!("name")), "name should be required");
     }
 }
