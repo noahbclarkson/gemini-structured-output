@@ -6,6 +6,7 @@ use schemars::{
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tracing::debug;
 
 use crate::error::{Result, StructuredError};
 
@@ -85,10 +86,20 @@ pub trait GeminiValidator {
 
 /// Recursively strip or normalize fields that Gemini strict schema mode does not support.
 pub fn clean_schema_for_gemini(value: &mut Value) {
+    debug!(
+        schema_before = %serde_json::to_string_pretty(value).unwrap_or_default(),
+        "Schema before cleaning"
+    );
+
     let snapshot = value.clone();
     let mut stack = Vec::new();
     inline_refs(value, &snapshot, &mut stack);
     clean_schema_node(value);
+
+    debug!(
+        schema_after = %serde_json::to_string_pretty(value).unwrap_or_default(),
+        "Schema after cleaning"
+    );
 }
 
 fn inline_refs(value: &mut Value, root: &Value, stack: &mut Vec<String>) {
@@ -262,12 +273,8 @@ fn flatten_variants(parent: &mut Map<String, Value>, variants: Vec<Value>) {
         );
     }
 
-    // Recursively clean the merged properties
-    if let Some(Value::Object(props)) = parent.get_mut("properties") {
-        for sub_schema in props.values_mut() {
-            clean_schema_node(sub_schema);
-        }
-    }
+    // Note: We don't need to clean properties here because variants are pre-cleaned
+    // before being passed to flatten_variants.
 }
 
 /// Clean a schema node based on Gemini's supported properties per type.
@@ -590,10 +597,12 @@ fn clean_schema_node(value: &mut Value) {
                         clean_schema_node(item);
                     }
                 }
-            } else if key != "required" && key != "enum" && key != "type" {
-                // Recurse into other nested values (but not simple property values)
-                clean_schema_node(v);
             }
+            // Note: We intentionally DON'T recursively clean other keys like "anyOf", "oneOf",
+            // "description", "nullable", etc. These are either:
+            // - Already handled earlier in this function (anyOf/oneOf)
+            // - Simple scalar values that don't need cleaning (description, nullable, title)
+            // - Would cause infinite recursion if re-cleaned (anyOf variants)
         }
 
         // SPECIAL HANDLING FOR HASHMAPS (additionalProperties)
