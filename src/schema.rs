@@ -330,6 +330,43 @@ fn clean_schema_node(value: &mut Value) {
             }
         }
 
+        // Normalize array types to single types with nullable flag.
+        // Gemini API requires type: "string", not type: ["string", "null"].
+        // This fixes "Proto field is not repeating, cannot start list" errors.
+        if let Some(Value::Array(types)) = map.get("type").cloned() {
+            let type_strs: Vec<String> = types
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+
+            let has_null = type_strs.iter().any(|t| t == "null");
+            let real_types: Vec<String> = type_strs.into_iter().filter(|t| t != "null").collect();
+
+            if real_types.len() == 1 {
+                // Case: ["integer", "null"] -> type: "integer", nullable: true
+                map.insert("type".to_string(), json!(real_types[0]));
+                if has_null {
+                    map.insert("nullable".to_string(), json!(true));
+                }
+            } else if real_types.is_empty() && has_null {
+                // Case: ["null"] -> remove type entirely or set nullable
+                map.remove("type");
+                map.insert("nullable".to_string(), json!(true));
+            } else if !real_types.is_empty() {
+                // Case: ["string", "number"] -> convert to anyOf (rare, but handle it)
+                let variants: Vec<Value> = real_types
+                    .into_iter()
+                    .map(|t| json!({ "type": t }))
+                    .collect();
+
+                map.remove("type");
+                map.insert("anyOf".to_string(), Value::Array(variants));
+                if has_null {
+                    map.insert("nullable".to_string(), json!(true));
+                }
+            }
+        }
+
         // Properties that are never supported by Gemini
         // Note: "const" is handled manually below during oneOf/anyOf processing
         let always_unsupported = [
@@ -1091,5 +1128,73 @@ mod tests {
             .expect("required should exist");
         assert!(required.contains(&json!("id")), "id should be required");
         assert!(required.contains(&json!("name")), "name should be required");
+    }
+
+    /// Test that array types are normalized to single types with nullable flag.
+    /// Gemini API requires type: "string", not type: ["string", "null"].
+    #[test]
+    fn array_type_normalized_to_single_with_nullable() {
+        // Standard JSON Schema nullable pattern
+        let mut schema = json!({
+            "type": ["integer", "null"],
+            "description": "An optional count"
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        // Should be normalized to single type with nullable
+        assert_eq!(
+            schema.get("type"),
+            Some(&json!("integer")),
+            "type should be a single string, not an array"
+        );
+        assert_eq!(
+            schema.get("nullable"),
+            Some(&json!(true)),
+            "nullable should be true"
+        );
+        assert_eq!(
+            schema.get("description"),
+            Some(&json!("An optional count")),
+            "description should be preserved"
+        );
+    }
+
+    /// Test array type without null is normalized to single type
+    #[test]
+    fn array_type_single_element_normalized() {
+        let mut schema = json!({
+            "type": ["string"]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        assert_eq!(schema.get("type"), Some(&json!("string")));
+        assert!(schema.get("nullable").is_none());
+    }
+
+    /// Test that allOf with array types are properly handled
+    #[test]
+    fn allof_with_array_type_normalized() {
+        // Simulate allOf sub-schema having array type (from standard JSON Schema)
+        let mut schema = json!({
+            "description": "A nullable field",
+            "allOf": [
+                {
+                    "type": ["integer", "null"],
+                    "minimum": 0
+                }
+            ]
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        // allOf should be removed
+        assert!(schema.get("allOf").is_none());
+
+        // Type should be normalized
+        assert_eq!(schema.get("type"), Some(&json!("integer")));
+        assert_eq!(schema.get("nullable"), Some(&json!(true)));
+        assert_eq!(schema.get("description"), Some(&json!("A nullable field")));
     }
 }
