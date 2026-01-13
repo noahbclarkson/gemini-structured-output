@@ -727,11 +727,27 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
             }
         }
         Value::Object(map) => {
-            // Handle objects: recurse into properties
+            // Handle standard objects: recurse into properties
             if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
                 for (k, v) in map {
                     if let Some(sub_schema) = props.get(k) {
                         recover_internally_tagged_enums(v, sub_schema);
+                    }
+                }
+            }
+            // Handle Normalized Maps: Data is Object, but Schema is Gemini KV-Array
+            // ({type: "array", items: {properties: {__key__, __value__}}})
+            // This mismatch occurs because normalize_json_response runs before this function,
+            // converting the KV-Array back into a Map, but the schema is still in Array format.
+            else if let Some(items) = schema.get("items") {
+                // If the schema describes the special KV-pair structure, apply
+                // the "__value__" sub-schema to all values in the normalized map.
+                if let Some(value_schema) = items
+                    .get("properties")
+                    .and_then(|p| p.get("__value__"))
+                {
+                    for v in map.values_mut() {
+                        recover_internally_tagged_enums(v, value_schema);
                     }
                 }
             }
@@ -1412,6 +1428,72 @@ mod tests {
 
         // Should remain unchanged
         assert_eq!(value, original);
+    }
+
+    /// Test recovery in normalized HashMaps (where data is Object but schema is Array)
+    #[test]
+    fn recover_internally_tagged_enum_in_normalized_hashmap() {
+        // Schema for a HashMap where values contain internally-tagged enums
+        // This mimics the Gemini transformation: HashMap -> Array with {__key__, __value__}
+        // Note: After Gemini schema cleaning, anyOf is often flattened, but we still need
+        // to handle the case where it remains for complex enums
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "__key__": { "type": "string" },
+                            "__value__": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "alpha" }
+                                        },
+                                        "required": ["kind"]
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "beta" }
+                                        },
+                                        "required": ["kind"]
+                                    }
+                                ]
+                            }
+                        },
+                        "required": ["__key__", "__value__"]
+                    }
+                }
+            }
+        });
+
+        // This represents the data AFTER normalize_json_response has run
+        // (converting the KV-Array back to an Object)
+        let mut value = json!({
+            "config": {
+                "item1": "alpha",  // Collapsed enum (entire object collapsed to string)
+                "item2": "beta"
+            }
+        });
+
+        recover_internally_tagged_enums(&mut value, &schema);
+
+        // The nested enums should be recovered even though the HashMap is normalized
+        assert_eq!(
+            value.get("config").and_then(|o| o.get("item1")),
+            Some(&json!({"kind": "alpha"})),
+            "Nested enum in normalized HashMap should be recovered"
+        );
+
+        assert_eq!(
+            value.get("config").and_then(|o| o.get("item2")),
+            Some(&json!({"kind": "beta"})),
+            "All values in normalized HashMap should be processed"
+        );
     }
 
     /// Test recovery with enum (single-element array) instead of const
