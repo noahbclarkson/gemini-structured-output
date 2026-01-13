@@ -679,6 +679,114 @@ pub fn normalize_json_response(value: &mut Value) {
     }
 }
 
+/// Helper to check if a schema node requires a specific string value.
+/// Used to match collapsed string values against schema constraints.
+fn schema_matches_const_string(schema: &Value, target: &str) -> bool {
+    // Case 1: "const": "mstl"
+    if let Some(c) = schema.get("const").and_then(|v| v.as_str()) {
+        return c == target;
+    }
+
+    // Case 2: "enum": ["mstl"]
+    if let Some(enums) = schema.get("enum").and_then(|v| v.as_array()) {
+        // Only match if it's a specific signifier, usually arrays of size 1 for tags
+        if enums.len() == 1 {
+            if let Some(e_str) = enums[0].as_str() {
+                return e_str == target;
+            }
+        }
+    }
+
+    false
+}
+
+/// Recursively attempts to recover internally tagged enums where the LLM
+/// output a string literal instead of the wrapper object.
+///
+/// Example: matches "mstl" against a schema expecting { "type": "mstl" }
+/// and rewrites the JSON value to match the schema.
+///
+/// This handles Gemini's tendency (especially with Flash models) to collapse
+/// objects with single discriminator fields into just the string value.
+pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
+    match value {
+        Value::Array(arr) => {
+            // Handle arrays: check if schema defines items
+            if let Some(items_schema) = schema.get("items") {
+                for item in arr {
+                    recover_internally_tagged_enums(item, items_schema);
+                }
+            } else if let Some(prefix_items) = schema.get("prefixItems").and_then(|v| v.as_array())
+            {
+                // Handle tuple structs / prefixItems
+                for (i, item) in arr.iter_mut().enumerate() {
+                    if let Some(sub_schema) = prefix_items.get(i) {
+                        recover_internally_tagged_enums(item, sub_schema);
+                    }
+                }
+            }
+        }
+        Value::Object(map) => {
+            // Handle objects: recurse into properties
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                for (k, v) in map {
+                    if let Some(sub_schema) = props.get(k) {
+                        recover_internally_tagged_enums(v, sub_schema);
+                    }
+                }
+            }
+        }
+        Value::String(s) => {
+            // THE FIX: Check if this string should actually be an object
+            // This happens when serde(tag=...) is used and the LLM optimizes away the wrapper.
+
+            // Check if we are inside a oneOf/anyOf
+            let variants = schema
+                .get("oneOf")
+                .or_else(|| schema.get("anyOf"))
+                .and_then(|v| v.as_array());
+
+            if let Some(variants) = variants {
+                for variant in variants {
+                    // We are looking for a variant that is an OBJECT containing a property
+                    // that matches our string exactly.
+                    if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
+                        for (prop_name, prop_schema) in props {
+                            // Does this property match our string?
+                            if schema_matches_const_string(prop_schema, s) {
+                                // Found it! Transform "val" -> { "tag": "val" }
+                                debug!(
+                                    "Recovering internally tagged enum: expanded string '{}' to object with tag '{}'",
+                                    s, prop_name
+                                );
+                                *value = json!({ prop_name: s });
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Also check the root properties case (less common for enums but possible)
+            if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                for (prop_name, prop_schema) in props {
+                    if schema_matches_const_string(prop_schema, s) {
+                        // Check if this property is REQUIRED. If so, and we only have a string,
+                        // the LLM likely collapsed the object to this single identifying property.
+                        if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
+                            if req.contains(&json!(prop_name)) {
+                                *value = json!({ prop_name: s });
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Convert an OpenAPI-style schema (with nullable: true) to a standard JSON Schema
 /// (with type: [T, "null"]) for compatibility with the jsonschema crate.
 fn to_standard_json_schema(mut schema: Value) -> Value {
@@ -1186,6 +1294,164 @@ mod tests {
         assert_eq!(schema.get("type"), Some(&json!("integer")));
         assert_eq!(schema.get("nullable"), Some(&json!(true)));
         assert_eq!(schema.get("description"), Some(&json!("A nullable field")));
+    }
+
+    /// Test that internally-tagged enums collapsed to strings are recovered
+    #[test]
+    fn recover_internally_tagged_enum_from_string() {
+        // Schema for an internally-tagged enum with "type" discriminator
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "processor": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "const": "mstl" }
+                            },
+                            "required": ["type"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "const": "arima" }
+                            },
+                            "required": ["type"]
+                        }
+                    ]
+                }
+            }
+        });
+
+        // Gemini collapsed the object to just the string value
+        let mut value = json!({
+            "processor": "mstl"
+        });
+
+        recover_internally_tagged_enums(&mut value, &schema);
+
+        // Should be expanded back to object form
+        assert_eq!(
+            value.get("processor"),
+            Some(&json!({"type": "mstl"})),
+            "String should be recovered to object with tag field"
+        );
+    }
+
+    /// Test that recovery works in nested structures (arrays)
+    #[test]
+    fn recover_internally_tagged_enum_in_array() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": { "const": "foo" }
+                                },
+                                "required": ["kind"]
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": { "const": "bar" }
+                                },
+                                "required": ["kind"]
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+
+        let mut value = json!({
+            "items": ["foo", "bar", "foo"]
+        });
+
+        recover_internally_tagged_enums(&mut value, &schema);
+
+        // All array items should be recovered
+        let items = value.get("items").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(items[0], json!({"kind": "foo"}));
+        assert_eq!(items[1], json!({"kind": "bar"}));
+        assert_eq!(items[2], json!({"kind": "foo"}));
+    }
+
+    /// Test that recovery doesn't affect non-collapsed values
+    #[test]
+    fn recover_leaves_valid_objects_unchanged() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "processor": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "const": "mstl" }
+                            },
+                            "required": ["type"]
+                        }
+                    ]
+                }
+            }
+        });
+
+        // Already in correct object form
+        let mut value = json!({
+            "processor": {"type": "mstl"}
+        });
+
+        let original = value.clone();
+        recover_internally_tagged_enums(&mut value, &schema);
+
+        // Should remain unchanged
+        assert_eq!(value, original);
+    }
+
+    /// Test recovery with enum (single-element array) instead of const
+    #[test]
+    fn recover_with_enum_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "variant": { "enum": ["alpha"] }
+                            },
+                            "required": ["variant"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "variant": { "enum": ["beta"] }
+                            },
+                            "required": ["variant"]
+                        }
+                    ]
+                }
+            }
+        });
+
+        let mut value = json!({
+            "mode": "alpha"
+        });
+
+        recover_internally_tagged_enums(&mut value, &schema);
+
+        assert_eq!(
+            value.get("mode"),
+            Some(&json!({"variant": "alpha"})),
+            "String should be recovered using enum schema"
+        );
     }
 
     /// Test that allOf containing oneOf (enum with description) is properly merged.

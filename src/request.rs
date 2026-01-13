@@ -400,6 +400,10 @@ where
                         // Apply normalization for HashMap schemas that were transformed to arrays
                         crate::schema::normalize_json_response(&mut json_value);
 
+                        // Recover internally-tagged enums that Gemini collapsed to strings
+                        let schema = T::gemini_schema();
+                        crate::schema::recover_internally_tagged_enums(&mut json_value, &schema);
+
                         match serde_json::from_value::<T>(json_value) {
                             Ok(parsed) => {
                                 debug!("Successfully parsed structured response");
@@ -622,6 +626,11 @@ where
                 let mut json_value: Value = serde_json::from_str(&cleaned)
                     .map_err(|e| StructuredError::parse_error(e, &cleaned))?;
                 crate::schema::normalize_json_response(&mut json_value);
+
+                // Recover internally-tagged enums that Gemini collapsed to strings
+                let schema = T::gemini_schema();
+                crate::schema::recover_internally_tagged_enums(&mut json_value, &schema);
+
                 let parsed: T = serde_json::from_value(json_value)
                     .map_err(|e| StructuredError::parse_error(e, &cleaned))?;
 
