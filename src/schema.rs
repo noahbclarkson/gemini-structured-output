@@ -285,120 +285,169 @@ fn flatten_variants(parent: &mut Map<String, Value>, variants: Vec<Value>) {
 /// - For strings: enum, format
 /// - For numbers/integers: enum, minimum, maximum
 /// - For arrays: items, prefixItems, minItems, maxItems
-fn clean_schema_node(value: &mut Value) {
-    if let Value::Object(map) = value {
-        // Handle allOf by merging sub-schemas into the parent.
-        // This is crucial for handling schemars' pattern of using allOf to attach descriptions to refs.
-        // Example: { "description": "...", "allOf": [{"$ref": "..."}] }
-        // After ref inlining becomes: { "description": "...", "allOf": [{ "type": "object", ... }] }
-        // We merge the allOf contents into the parent to preserve the type definition.
-        if let Some(Value::Array(all_of)) = map.remove("allOf") {
-            for sub_schema in all_of {
-                if let Value::Object(sub_map) = sub_schema {
-                    for (k, v) in sub_map {
-                        match k.as_str() {
-                            "properties" => {
-                                // Merge properties: add child properties to parent
-                                let parent_props = map
-                                    .entry("properties")
-                                    .or_insert(json!({}))
-                                    .as_object_mut()
+///
+/// This function uses an iterative approach with an explicit stack to avoid
+/// call stack overflow when processing deeply nested schemas (e.g., recursive types).
+fn clean_schema_node(root: &mut Value) {
+    // Iterative cleaning using explicit stack.
+    // We may need multiple passes because:
+    // 1. oneOf/anyOf variants may have allOf that needs merging first
+    // 2. After allOf is merged, we can properly detect variant types
+    const MAX_PASSES: usize = 100;
+
+    for _ in 0..MAX_PASSES {
+        let mut changed = false;
+        let mut stack: Vec<*mut Value> = vec![root as *mut Value];
+
+        while let Some(ptr) = stack.pop() {
+            // SAFETY: These pointers come from our owned data structure.
+            // We never create aliasing mutable references - each node is
+            // visited exactly once per pass.
+            let value = unsafe { &mut *ptr };
+
+            if let Value::Object(map) = value {
+                changed |= clean_object_node(map);
+
+                // Queue all children for processing (including anyOf/oneOf variants)
+                for v in map.values_mut() {
+                    stack.push(v as *mut Value);
+                }
+            } else if let Value::Array(arr) = value {
+                for v in arr.iter_mut() {
+                    stack.push(v as *mut Value);
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Process a single object node. Returns true if any changes were made.
+fn clean_object_node(map: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+
+    // Handle allOf by merging sub-schemas into the parent.
+    // This is crucial for handling schemars' pattern of using allOf to attach descriptions to refs.
+    if let Some(Value::Array(all_of)) = map.remove("allOf") {
+        changed = true;
+        for sub_schema in all_of {
+            if let Value::Object(sub_map) = sub_schema {
+                for (k, v) in sub_map {
+                    match k.as_str() {
+                        "properties" => {
+                            // Merge properties: add child properties to parent
+                            let parent_props = map
+                                .entry("properties")
+                                .or_insert(json!({}))
+                                .as_object_mut()
+                                .unwrap();
+                            if let Value::Object(child_props) = v {
+                                for (pk, pv) in child_props {
+                                    parent_props.insert(pk, pv);
+                                }
+                            }
+                        }
+                        "required" => {
+                            // Merge required arrays, avoiding duplicates
+                            if let Value::Array(child_req) = v {
+                                let parent_req = map
+                                    .entry("required")
+                                    .or_insert(json!([]))
+                                    .as_array_mut()
                                     .unwrap();
-                                if let Value::Object(child_props) = v {
-                                    for (pk, pv) in child_props {
-                                        parent_props.insert(pk, pv);
+                                for r in child_req {
+                                    if !parent_req.contains(&r) {
+                                        parent_req.push(r);
                                     }
                                 }
                             }
-                            "required" => {
-                                // Merge required arrays, avoiding duplicates
-                                if let Value::Array(child_req) = v {
-                                    let parent_req = map
-                                        .entry("required")
-                                        .or_insert(json!([]))
-                                        .as_array_mut()
-                                        .unwrap();
-                                    for r in child_req {
-                                        if !parent_req.contains(&r) {
-                                            parent_req.push(r);
-                                        }
-                                    }
-                                }
-                            }
-                            // For other keys (type, enum, items, etc.), adopt them if missing in parent
-                            _ => {
-                                if !map.contains_key(&k) {
-                                    map.insert(k, v);
-                                }
+                        }
+                        // For other keys (type, enum, items, etc.), adopt them if missing in parent
+                        _ => {
+                            if !map.contains_key(&k) {
+                                map.insert(k, v);
                             }
                         }
                     }
                 }
             }
         }
+    }
 
-        // Normalize array types to single types with nullable flag.
-        // Gemini API requires type: "string", not type: ["string", "null"].
-        // This fixes "Proto field is not repeating, cannot start list" errors.
-        if let Some(Value::Array(types)) = map.get("type").cloned() {
-            let type_strs: Vec<String> = types
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
+    // Normalize array types to single types with nullable flag.
+    // Gemini API requires type: "string", not type: ["string", "null"].
+    if let Some(Value::Array(types)) = map.get("type").cloned() {
+        let type_strs: Vec<String> = types
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
 
-            let has_null = type_strs.iter().any(|t| t == "null");
-            let real_types: Vec<String> = type_strs.into_iter().filter(|t| t != "null").collect();
+        let has_null = type_strs.iter().any(|t| t == "null");
+        let real_types: Vec<String> = type_strs.into_iter().filter(|t| t != "null").collect();
 
-            if real_types.len() == 1 {
-                // Case: ["integer", "null"] -> type: "integer", nullable: true
-                map.insert("type".to_string(), json!(real_types[0]));
-                if has_null {
-                    map.insert("nullable".to_string(), json!(true));
-                }
-            } else if real_types.is_empty() && has_null {
-                // Case: ["null"] -> remove type entirely or set nullable
-                map.remove("type");
+        if real_types.len() == 1 {
+            changed = true;
+            map.insert("type".to_string(), json!(real_types[0]));
+            if has_null {
                 map.insert("nullable".to_string(), json!(true));
-            } else if !real_types.is_empty() {
-                // Case: ["string", "number"] -> convert to anyOf (rare, but handle it)
-                let variants: Vec<Value> = real_types
-                    .into_iter()
-                    .map(|t| json!({ "type": t }))
-                    .collect();
-
-                map.remove("type");
-                map.insert("anyOf".to_string(), Value::Array(variants));
-                if has_null {
-                    map.insert("nullable".to_string(), json!(true));
-                }
+            }
+        } else if real_types.is_empty() && has_null {
+            changed = true;
+            map.remove("type");
+            map.insert("nullable".to_string(), json!(true));
+        } else if !real_types.is_empty() {
+            changed = true;
+            let variants: Vec<Value> = real_types
+                .into_iter()
+                .map(|t| json!({ "type": t }))
+                .collect();
+            map.remove("type");
+            map.insert("anyOf".to_string(), Value::Array(variants));
+            if has_null {
+                map.insert("nullable".to_string(), json!(true));
             }
         }
+    }
 
-        // Properties that are never supported by Gemini
-        // Note: "const" is handled manually below during oneOf/anyOf processing
-        let always_unsupported = [
-            "$schema",
-            "$ref",
-            "components",
-            "definitions",
-            "$defs",
-            "default",
-            "examples",
-            "not",
-            "if",
-            "then",
-            "else",
-        ];
+    // Properties that are never supported by Gemini
+    let always_unsupported = [
+        "$schema",
+        "$ref",
+        "components",
+        "definitions",
+        "$defs",
+        "default",
+        "examples",
+        "not",
+        "if",
+        "then",
+        "else",
+    ];
 
-        for key in always_unsupported {
-            map.remove(key);
+    for key in always_unsupported {
+        if map.remove(key).is_some() {
+            changed = true;
         }
+    }
 
-        // Handle oneOf/anyOf intelligently based on variant types
-        if let Some(Value::Array(mut variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf"))
-        {
-            // Check if this is a simple string enum FIRST (before cleaning removes const).
-            // Schemars generates these as: { "type": "string", "const": "Value" }
+    // Handle oneOf/anyOf intelligently based on variant types
+    if let Some(Value::Array(variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf")) {
+        changed = true;
+
+        // Check if any variant still has allOf (needs another pass to process)
+        let variants_need_processing = variants
+            .iter()
+            .any(|v| v.get("allOf").is_some());
+
+        if variants_need_processing {
+            // Put it back as anyOf - it will be processed in the next pass
+            // after the variants' allOf are merged
+            map.insert("anyOf".to_string(), Value::Array(variants));
+        } else {
+            // Check if this is a simple string enum
             let is_pure_string_enum = variants.iter().all(|v| {
                 let is_string = v.get("type").and_then(|t| t.as_str()) == Some("string");
                 let has_const_string = v.get("const").and_then(|c| c.as_str()).is_some();
@@ -408,9 +457,7 @@ fn clean_schema_node(value: &mut Value) {
             });
 
             if is_pure_string_enum {
-                // CASE 1: Pure String Enum (e.g., AccountType)
-                // Convert to { "type": "string", "enum": ["A", "B"] }
-                // No need to clean variants - we're just extracting const/enum values.
+                // CASE 1: Pure String Enum - convert to { "type": "string", "enum": [...] }
                 let mut enum_values = Vec::new();
                 for v in &variants {
                     if let Some(c) = v.get("const") {
@@ -419,249 +466,175 @@ fn clean_schema_node(value: &mut Value) {
                         enum_values.extend(enums.clone());
                     }
                 }
-                // Deduplicate
                 enum_values.sort_by_key(|a| a.to_string());
                 enum_values.dedup();
 
                 map.insert("type".to_string(), json!("string"));
                 map.insert("enum".to_string(), Value::Array(enum_values));
             } else {
-                // CRITICAL: Recursively clean all variants BEFORE flattening/detection.
-                // This ensures 'allOf' inside variants is merged, exposing 'properties'
-                // so that object detection and flattening work correctly.
-                // Without this, variants wrapped in allOf would appear empty.
-                for variant in &mut variants {
-                    clean_schema_node(variant);
-                }
-
                 // Check for mixed types (Strings AND Objects)
-                // This happens in Rust enums with both Unit and Struct variants
                 let has_objects = variants.iter().any(|v| {
                     v.get("type").and_then(|t| t.as_str()) == Some("object")
                         || v.get("properties").is_some()
                 });
                 let has_strings = variants.iter().any(|v| {
                     v.get("type").and_then(|t| t.as_str()) == Some("string")
-                        || v.get("enum").is_some() // After cleaning, const becomes enum
+                        || v.get("enum").is_some()
                 });
 
                 if has_objects && has_strings {
-                    // CASE 2: Mixed Enum (e.g., SeasonalityProfileId with both "Flat" and { "Custom": ... })
-                    // We cannot flatten this into a single object.
-                    // Preserve as `anyOf` and let Gemini handle it (supported in newer models).
-                    // Variants are already cleaned above.
+                    // CASE 2: Mixed Enum - preserve as anyOf
                     map.insert("anyOf".to_string(), Value::Array(variants));
-
-                    // Remove specific type constraints from the parent if they exist
-                    // because the child can be either string OR object.
                     map.remove("type");
                     map.remove("properties");
                     map.remove("required");
                     map.remove("enum");
                 } else {
-                    // CASE 3: Complex Object Union
-                    // Proceed with existing flattening logic.
-                    // Variants are already cleaned above.
+                    // CASE 3: Complex Object Union - flatten
                     flatten_variants(map, variants);
                 }
             }
         }
+    }
 
-        // Remove const at the top level (we've already extracted values from variants above)
-        map.remove("const");
+    // Remove const at the top level
+    if map.remove("const").is_some() {
+        changed = true;
+    }
 
-        // Get the type to determine which properties to keep
-        let schema_type = get_schema_type(map).map(|s| s.to_string());
+    // Get the type to determine which properties to keep
+    let schema_type = get_schema_type(map).map(|s| s.to_string());
 
-        // Properties only valid for specific types
-        match schema_type.as_deref() {
-            Some("object") => {
-                // Object types support: properties, required
-                // Note: additionalProperties is handled specially below for HashMap transformation
-                // Remove string-specific properties
-                map.remove("pattern");
-                map.remove("minLength");
-                map.remove("maxLength");
-                map.remove("format");
-                // Remove array-specific properties
-                map.remove("items");
-                map.remove("prefixItems");
-                map.remove("minItems");
-                map.remove("maxItems");
-                // Remove number-specific properties
-                map.remove("minimum");
-                map.remove("maximum");
-                map.remove("minProperties");
-                map.remove("maxProperties");
-            }
-            Some("array") => {
-                // Array types support: items, prefixItems, minItems, maxItems
-                // Remove object-specific properties
-                map.remove("properties");
-                map.remove("required");
-                map.remove("additionalProperties");
-                // Remove string-specific properties
-                map.remove("pattern");
-                map.remove("minLength");
-                map.remove("maxLength");
-                map.remove("format");
-                // Remove number-specific properties
-                map.remove("minimum");
-                map.remove("maximum");
-                map.remove("minProperties");
-                map.remove("maxProperties");
-            }
-            Some("string") => {
-                // String types support: enum, format
-                // Remove object-specific properties
-                map.remove("properties");
-                map.remove("required");
-                map.remove("additionalProperties");
-                // Remove array-specific properties
-                map.remove("items");
-                map.remove("prefixItems");
-                map.remove("minItems");
-                map.remove("maxItems");
-                // Remove number-specific properties
-                map.remove("minimum");
-                map.remove("maximum");
-                // Remove unsupported string validation (Gemini doesn't support these)
-                map.remove("pattern");
-                map.remove("minLength");
-                map.remove("maxLength");
-                map.remove("minProperties");
-                map.remove("maxProperties");
-            }
-            Some("number") | Some("integer") => {
-                // Number types support: enum, minimum, maximum
-                // Remove object-specific properties
-                map.remove("properties");
-                map.remove("required");
-                map.remove("additionalProperties");
-                // Remove array-specific properties
-                map.remove("items");
-                map.remove("prefixItems");
-                map.remove("minItems");
-                map.remove("maxItems");
-                // Remove string-specific properties
-                map.remove("pattern");
-                map.remove("minLength");
-                map.remove("maxLength");
-                map.remove("format");
-                map.remove("minProperties");
-                map.remove("maxProperties");
-            }
-            Some("boolean") | Some("null") => {
-                // Boolean/null types don't have type-specific properties
-                map.remove("properties");
-                map.remove("required");
-                map.remove("additionalProperties");
-                map.remove("items");
-                map.remove("prefixItems");
-                map.remove("minItems");
-                map.remove("maxItems");
-                map.remove("pattern");
-                map.remove("minLength");
-                map.remove("maxLength");
-                map.remove("format");
-                map.remove("minimum");
-                map.remove("maximum");
-                map.remove("minProperties");
-                map.remove("maxProperties");
-            }
-            _ => {
-                // Unknown or missing type - be conservative and remove most things
-                map.remove("additionalProperties");
-                map.remove("pattern");
-                map.remove("minLength");
-                map.remove("maxLength");
-                map.remove("minProperties");
-                map.remove("maxProperties");
-            }
+    // Properties only valid for specific types
+    match schema_type.as_deref() {
+        Some("object") => {
+            map.remove("pattern");
+            map.remove("minLength");
+            map.remove("maxLength");
+            map.remove("format");
+            map.remove("items");
+            map.remove("prefixItems");
+            map.remove("minItems");
+            map.remove("maxItems");
+            map.remove("minimum");
+            map.remove("maximum");
+            map.remove("minProperties");
+            map.remove("maxProperties");
         }
-
-        // Recursively clean nested schemas
-        for (key, v) in map.iter_mut() {
-            if key == "properties" {
-                if let Value::Object(sub_map) = v {
-                    for sub_schema in sub_map.values_mut() {
-                        clean_schema_node(sub_schema);
-                    }
-                }
-            } else if key == "items" {
-                // items can be a schema itself
-                clean_schema_node(v);
-            } else if key == "prefixItems" {
-                if let Value::Array(arr) = v {
-                    for item in arr {
-                        clean_schema_node(item);
-                    }
-                }
-            }
-            // Note: We intentionally DON'T recursively clean other keys like "anyOf", "oneOf",
-            // "description", "nullable", etc. These are either:
-            // - Already handled earlier in this function (anyOf/oneOf)
-            // - Simple scalar values that don't need cleaning (description, nullable, title)
-            // - Would cause infinite recursion if re-cleaned (anyOf variants)
+        Some("array") => {
+            map.remove("properties");
+            map.remove("required");
+            map.remove("additionalProperties");
+            map.remove("pattern");
+            map.remove("minLength");
+            map.remove("maxLength");
+            map.remove("format");
+            map.remove("minimum");
+            map.remove("maximum");
+            map.remove("minProperties");
+            map.remove("maxProperties");
         }
-
-        // SPECIAL HANDLING FOR HASHMAPS (additionalProperties)
-        // Gemini rejects additionalProperties. We transform this pattern:
-        // { "type": "object", "additionalProperties": { ...value_schema... } }
-        // INTO:
-        // { "type": "array", "items": { "type": "object", "properties": { "__key__": { "type": "string" }, "__value__": { ...value_schema... } }, "required": ["__key__", "__value__"] } }
-        if let Some(mut add_props) = map.remove("additionalProperties") {
-            // Only transform if it's a map schema (no specific properties defined)
-            let has_specific_props = map
-                .get("properties")
-                .and_then(|p| p.as_object())
-                .is_some_and(|o| !o.is_empty());
-
-            if !has_specific_props && add_props.is_object() {
-                // Ensure the inner schema is cleaned *before* wrapping it
-                clean_schema_node(&mut add_props);
-
-                map.insert("type".to_string(), json!("array"));
-                map.insert(
-                    "items".to_string(),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "__key__": { "type": "string" },
-                            "__value__": add_props
-                        },
-                        "required": ["__key__", "__value__"]
-                    }),
-                );
-                // Remove object-specific fields that might linger
-                map.remove("required");
-                map.remove("properties");
-            }
+        Some("string") => {
+            map.remove("properties");
+            map.remove("required");
+            map.remove("additionalProperties");
+            map.remove("items");
+            map.remove("prefixItems");
+            map.remove("minItems");
+            map.remove("maxItems");
+            map.remove("minimum");
+            map.remove("maximum");
+            map.remove("pattern");
+            map.remove("minLength");
+            map.remove("maxLength");
+            map.remove("minProperties");
+            map.remove("maxProperties");
         }
-
-        // GENERAL CLEANUP FOR EMPTY OBJECTS
-        // If we have type: object but NO properties (e.g. unit variants like "LastValue": {}),
-        // Gemini API throws "properties should be non-empty".
-        // Remove "type": "object" to relax the constraint for these nodes.
-        if get_schema_type(map) == Some("object") {
-            let has_properties = map
-                .get("properties")
-                .and_then(|p| p.as_object())
-                .map(|p| !p.is_empty())
-                .unwrap_or(false);
-
-            if !has_properties {
-                map.remove("type");
-                map.remove("required");
-                map.remove("properties");
-                map.remove("additionalProperties");
-            }
+        Some("number") | Some("integer") => {
+            map.remove("properties");
+            map.remove("required");
+            map.remove("additionalProperties");
+            map.remove("items");
+            map.remove("prefixItems");
+            map.remove("minItems");
+            map.remove("maxItems");
+            map.remove("pattern");
+            map.remove("minLength");
+            map.remove("maxLength");
+            map.remove("format");
+            map.remove("minProperties");
+            map.remove("maxProperties");
         }
-    } else if let Value::Array(arr) = value {
-        for v in arr {
-            clean_schema_node(v);
+        Some("boolean") | Some("null") => {
+            map.remove("properties");
+            map.remove("required");
+            map.remove("additionalProperties");
+            map.remove("items");
+            map.remove("prefixItems");
+            map.remove("minItems");
+            map.remove("maxItems");
+            map.remove("pattern");
+            map.remove("minLength");
+            map.remove("maxLength");
+            map.remove("format");
+            map.remove("minimum");
+            map.remove("maximum");
+            map.remove("minProperties");
+            map.remove("maxProperties");
+        }
+        _ => {
+            map.remove("additionalProperties");
+            map.remove("pattern");
+            map.remove("minLength");
+            map.remove("maxLength");
+            map.remove("minProperties");
+            map.remove("maxProperties");
         }
     }
+
+    // SPECIAL HANDLING FOR HASHMAPS (additionalProperties)
+    if let Some(add_props) = map.remove("additionalProperties") {
+        changed = true;
+        let has_specific_props = map
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .is_some_and(|o| !o.is_empty());
+
+        if !has_specific_props && add_props.is_object() {
+            map.insert("type".to_string(), json!("array"));
+            map.insert(
+                "items".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "__key__": { "type": "string" },
+                        "__value__": add_props
+                    },
+                    "required": ["__key__", "__value__"]
+                }),
+            );
+            map.remove("required");
+            map.remove("properties");
+        }
+    }
+
+    // GENERAL CLEANUP FOR EMPTY OBJECTS
+    if get_schema_type(map) == Some("object") {
+        let has_properties = map
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .is_some_and(|p| !p.is_empty());
+
+        if !has_properties {
+            changed = true;
+            map.remove("type");
+            map.remove("required");
+            map.remove("properties");
+            map.remove("additionalProperties");
+        }
+    }
+
+    changed
 }
 
 /// Recursively normalizes the JSON response from Gemini.
