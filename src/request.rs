@@ -400,6 +400,9 @@ where
                         // Apply normalization for HashMap schemas that were transformed to arrays
                         crate::schema::normalize_json_response(&mut json_value);
 
+                        // Prune null fields to handle Gemini's flattened enum variants
+                        crate::schema::prune_null_fields(&mut json_value);
+
                         // Recover internally-tagged enums that Gemini collapsed to strings
                         let schema = T::gemini_schema();
                         crate::schema::recover_internally_tagged_enums(&mut json_value, &schema);
@@ -626,6 +629,9 @@ where
                 let mut json_value: Value = serde_json::from_str(&cleaned)
                     .map_err(|e| StructuredError::parse_error(e, &cleaned))?;
                 crate::schema::normalize_json_response(&mut json_value);
+
+                // Prune null fields to handle Gemini's flattened enum variants
+                crate::schema::prune_null_fields(&mut json_value);
 
                 // Recover internally-tagged enums that Gemini collapsed to strings
                 let schema = T::gemini_schema();

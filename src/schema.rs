@@ -679,6 +679,35 @@ pub fn normalize_json_response(value: &mut Value) {
     }
 }
 
+/// Recursively remove object keys where the value is null.
+///
+/// This is necessary because Gemini Strict Mode often outputs `{"optional_field": null}`
+/// for flattened oneOf variants, which confuses Serde if the Rust type is not Option<T>.
+///
+/// When schemas use internally-tagged enums (e.g., `#[serde(tag = "type")]`), Gemini
+/// may generate responses like `{"model": null, "calculation": {...}}` instead of
+/// just `{"calculation": {...}}`. This causes serde deserialization to fail because
+/// the field inside the enum variant is not `Option<T>`.
+///
+/// By pruning null values before deserialization, we allow serde to correctly
+/// identify the active variant.
+pub fn prune_null_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                prune_null_fields(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                prune_null_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Helper to check if a schema node allows a specific string value.
 /// Used to match collapsed string values against schema constraints.
 fn schema_matches_string_value(schema: &Value, target: &str) -> Option<String> {
