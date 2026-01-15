@@ -679,22 +679,17 @@ pub fn normalize_json_response(value: &mut Value) {
     }
 }
 
-/// Helper to check if a schema node requires a specific string value.
+/// Helper to check if a schema node allows a specific string value.
 /// Used to match collapsed string values against schema constraints.
-fn schema_matches_const_string(schema: &Value, target: &str) -> bool {
+fn schema_matches_string_value(schema: &Value, target: &str) -> bool {
     // Case 1: "const": "mstl"
     if let Some(c) = schema.get("const").and_then(|v| v.as_str()) {
         return c == target;
     }
 
-    // Case 2: "enum": ["mstl"]
+    // Case 2: "enum": ["mstl", "auto", "ets"]
     if let Some(enums) = schema.get("enum").and_then(|v| v.as_array()) {
-        // Only match if it's a specific signifier, usually arrays of size 1 for tags
-        if enums.len() == 1 {
-            if let Some(e_str) = enums[0].as_str() {
-                return e_str == target;
-            }
-        }
+        return enums.iter().any(|e| e.as_str() == Some(target));
     }
 
     false
@@ -769,7 +764,7 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
                     if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
                         for (prop_name, prop_schema) in props {
                             // Does this property match our string?
-                            if schema_matches_const_string(prop_schema, s) {
+                            if schema_matches_string_value(prop_schema, s) {
                                 // Found it! Transform "val" -> { "tag": "val" }
                                 debug!(
                                     "Recovering internally tagged enum: expanded string '{}' to object with tag '{}'",
@@ -786,7 +781,7 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
             // Also check the root properties case (less common for enums but possible)
             if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
                 for (prop_name, prop_schema) in props {
-                    if schema_matches_const_string(prop_schema, s) {
+                    if schema_matches_string_value(prop_schema, s) {
                         // Check if this property is REQUIRED. If so, and we only have a string,
                         // the LLM likely collapsed the object to this single identifying property.
                         if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
