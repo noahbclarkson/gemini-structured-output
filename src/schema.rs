@@ -103,6 +103,28 @@ pub fn clean_schema_for_gemini(value: &mut Value) {
     );
 }
 
+/// Strip x-* custom fields from a schema before sending to Gemini.
+/// These fields are used internally for unflattening but Gemini doesn't accept them.
+pub fn strip_x_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            // Remove all keys starting with "x-"
+            map.retain(|k, _| !k.starts_with("x-"));
+
+            // Recursively process remaining values
+            for v in map.values_mut() {
+                strip_x_fields(v);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                strip_x_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn inline_refs(value: &mut Value, root: &Value, stack: &mut Vec<String>) {
     match value {
         Value::Object(map) => {

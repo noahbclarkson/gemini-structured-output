@@ -527,6 +527,8 @@ impl StructuredClient {
 
         let mut cleaned_schema = json_schema;
         clean_schema_for_gemini(&mut cleaned_schema);
+        // Strip x-* fields before sending to Gemini (they're for internal use only)
+        crate::schema::strip_x_fields(&mut cleaned_schema);
         let mut generation_config = generation_config.unwrap_or_default();
         generation_config.response_schema = Some(cleaned_schema);
         generation_config
@@ -654,6 +656,12 @@ impl StructuredClient {
             safety_settings,
         } = opts;
         let schema = T::gemini_schema();
+
+        // Create a clean copy of the schema for Gemini (without x-* fields)
+        // The original schema with x-* fields will be used for unflattening
+        let mut gemini_schema = schema.clone();
+        crate::schema::strip_x_fields(&mut gemini_schema);
+
         let mut config = config.clone();
         let has_tools = !tools.is_empty();
         let model_str = self.model.as_str();
@@ -662,7 +670,7 @@ impl StructuredClient {
         let mut final_system_instruction = system_instruction.clone();
 
         // Log the schema that will be enforced for this request and how it is applied.
-        let schema_json = serde_json::to_string_pretty(&schema)
+        let schema_json = serde_json::to_string_pretty(&gemini_schema)
             .unwrap_or_else(|_| "Unable to serialize schema".to_string());
 
         if has_tools {
@@ -670,7 +678,7 @@ impl StructuredClient {
                 // Gemini 3: enable strict JSON outputs alongside tools.
                 debug!("Gemini 3 detected: enforcing JSON schema with tools enabled");
                 info!("Applying response schema via generation config (tools enabled):\n{schema_json}");
-                config.response_schema = Some(schema);
+                config.response_schema = Some(gemini_schema);
                 config
                     .response_mime_type
                     .get_or_insert_with(|| "application/json".to_string());
@@ -683,7 +691,7 @@ impl StructuredClient {
 
                 let schema_instruction = format!(
                     "You must output valid JSON matching this schema exactly:\n{}",
-                    serde_json::to_string_pretty(&schema).unwrap_or_default()
+                    serde_json::to_string_pretty(&gemini_schema).unwrap_or_default()
                 );
 
                 final_system_instruction = Some(match final_system_instruction {
@@ -693,7 +701,7 @@ impl StructuredClient {
             }
         } else {
             info!("Applying response schema via generation config (no tools):\n{schema_json}");
-            config.response_schema = Some(schema);
+            config.response_schema = Some(gemini_schema);
             config
                 .response_mime_type
                 .get_or_insert_with(|| "application/json".to_string());
