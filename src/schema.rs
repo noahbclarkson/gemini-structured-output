@@ -1116,8 +1116,21 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
             // Extract the variant data
             let mut variant_data = serde_json::Map::new();
             for field in &matched_variant.all_fields {
+                // Try exact match first
                 if let Some(field_value) = map.remove(field) {
                     variant_data.insert(field.clone(), field_value);
+                } else {
+                    // Try case-insensitive match with normalization (handles camelCase vs snake_case)
+                    let keys: Vec<String> = map.keys().cloned().collect();
+                    for key in keys {
+                        if is_variant_discriminator_match(&key, field) {
+                            if let Some(field_value) = map.remove(&key) {
+                                // Use the schema field name, not the JSON key name
+                                variant_data.insert(field.clone(), field_value);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1190,6 +1203,22 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
     }
 }
 
+/// Check if a string value could be a discriminator for a variant name.
+/// Returns true if they match with only case/separator differences (e.g., "auto" vs "Auto",
+/// "simpleAverage" vs "SimpleAverage"), but false if they're completely different strings
+/// (e.g., "mstl" vs "Model").
+fn is_variant_discriminator_match(value: &str, variant_name: &str) -> bool {
+    // Normalize both strings by converting to lowercase and removing separators
+    let normalize = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    };
+
+    normalize(value) == normalize(variant_name)
+}
+
 /// Identify which variant a flattened object represents
 fn identify_variant_from_fields(
     map: &serde_json::Map<String, Value>,
@@ -1214,13 +1243,50 @@ fn identify_variant_from_fields(
         );
     }
 
+    // Special case: Empty object after null pruning - match to unit variant if available
+    if present_fields.is_empty() {
+        let unit_variants: Vec<_> = variants.iter().filter(|v| v.is_unit).collect();
+        if let Some(unit_variant) = unit_variants.first() {
+            tracing::trace!(
+                variant_name = %unit_variant.name,
+                "Matched empty object to unit variant"
+            );
+            return Ok((*unit_variant).clone());
+        }
+    }
+
+    // Strategy 0: Single field whose name matches variant name
+    // Pattern: {"calculation": [...]} -> Calculation variant
+    // BUT: avoid matching if the variant has a field with the same name
+    // (e.g., Calculation variant with a "calculation" field)
+    if present_fields.len() == 1 {
+        let field_name = &present_fields[0];
+        for variant in variants {
+            if is_variant_discriminator_match(field_name, &variant.name) {
+                // Check if this variant has a field with the same name
+                let has_same_name_field = variant.all_fields.iter()
+                    .any(|f| is_variant_discriminator_match(f, field_name));
+
+                if !has_same_name_field {
+                    tracing::trace!(
+                        field_name = %field_name,
+                        variant_name = %variant.name,
+                        "Matched single field name to variant (no field collision)"
+                    );
+                    return Ok(variant.clone());
+                }
+            }
+        }
+    }
+
     // Strategy 1: Look for a discriminator field that matches a variant name
-    // Common patterns: "model": "mstl", "type": "auto", etc.
+    // Common patterns: "type": "auto" -> Auto, "type": "simpleAverage" -> SimpleAverage
     for (key, value) in map.iter() {
         if let Some(s) = value.as_str() {
             // Check if this string value matches a variant name
+            // Use stricter matching - the strings should be the same modulo casing/separators
             for variant in variants {
-                if s.eq_ignore_ascii_case(&variant.name) {
+                if is_variant_discriminator_match(s, &variant.name) {
                     // Found a discriminator! This is likely the variant
                     // Verify that other fields match
                     let other_fields: Vec<_> = present_fields.iter()
