@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 use gemini_rust::{Content, FileHandle, Gemini, GenerationConfig, Message, Part, Role};
-use serde::{de::DeserializeOwned, Serialize};
+use schemars::JsonSchema;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, instrument, trace, warn};
 
@@ -36,6 +37,24 @@ pub enum ValidationFailureStrategy {
     IterateForward,
     /// Revert to the last valid state and ask the model to try a different approach.
     Rollback,
+}
+
+/// Schema definition for a JSON Patch operation to ensure strict structured output.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "lowercase")]
+enum PatchOperationSchema {
+    Add { path: String, value: Value },
+    Remove { path: String },
+    Replace { path: String, value: Value },
+    Move { from: String, path: String },
+    Copy { from: String, path: String },
+    Test { path: String, value: Value },
+}
+
+/// Wrapper for the patch array to satisfy Gemini's preference for root objects.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct PatchResult {
+    patch: Vec<PatchOperationSchema>,
 }
 
 /// Builder for configuring and executing refinement with optional documents and dynamic context.
@@ -322,6 +341,7 @@ impl RefinementEngine {
         let use_generator = self.uses_generators();
 
         let system_prompt = self.build_system_prompt();
+        let patch_schema = PatchResult::gemini_schema();
 
         debug!(
             "Starting refinement loop with {:?}",
@@ -336,7 +356,7 @@ impl RefinementEngine {
                 .unwrap_or_default();
 
             let prompt = format!(
-                "Current JSON:\n{}\n\nTarget schema:\n{}\n\n{}Instruction:\n{}\n\nReturn a JSON Patch array:",
+                "Current JSON:\n{}\n\nTarget schema:\n{}\n\n{}Instruction:\n{}\n\nReturn a JSON object with a 'patch' array:",
                 serde_json::to_string_pretty(&working)?,
                 serde_json::to_string_pretty(&schema)?,
                 if dynamic_context.is_empty() {
@@ -360,6 +380,7 @@ impl RefinementEngine {
                         &prompt,
                         GenerationConfig {
                             response_mime_type: Some("application/json".to_string()),
+                            response_schema: Some(patch_schema.clone()),
                             temperature: Some(self.config.temperature),
                             ..Default::default()
                         },
@@ -379,6 +400,7 @@ impl RefinementEngine {
                             .with_system_instruction(&system_prompt)
                             .with_generation_config(GenerationConfig {
                                 response_mime_type: Some("application/json".to_string()),
+                                response_schema: Some(patch_schema.clone()),
                                 temperature: Some(self.config.temperature),
                                 ..Default::default()
                             });
@@ -446,22 +468,31 @@ impl RefinementEngine {
             };
 
             let cleaned_patch = clean_patch_text(&patch_text);
-            let mut patch: json_patch::Patch = match serde_json::from_str(cleaned_patch) {
+            let patch_result: PatchResult = match serde_json::from_str(cleaned_patch) {
                 Ok(p) => p,
                 Err(e) => {
-                    let msg = format!(
-                        "Model response was not valid JSON Patch: {e}; body={cleaned_patch}"
-                    );
-                    warn!(attempt = attempt_idx, error = %msg, "Invalid JSON Patch from model");
-                    attempts.push(RefinementAttempt::failure(patch_text.clone(), msg.clone()));
-                    conversation.push(Message::user(format!(
-                        "The patch could not be parsed: {msg}. Return only a valid JSON Patch array.\n\n\
-                         REMINDER - Original Instruction: {original_instruction}\n\
-                         Fix the errors while ensuring the original instruction is still met."
-                    )));
-                    continue;
+                    if let Ok(raw_ops) =
+                        serde_json::from_str::<Vec<PatchOperationSchema>>(cleaned_patch)
+                    {
+                        PatchResult { patch: raw_ops }
+                    } else {
+                        let msg = format!(
+                            "Model response was not valid JSON Patch: {e}; body={cleaned_patch}"
+                        );
+                        warn!(attempt = attempt_idx, error = %msg, "Invalid JSON Patch from model");
+                        attempts.push(RefinementAttempt::failure(patch_text.clone(), msg.clone()));
+                        conversation.push(Message::user(format!(
+                            "The patch could not be parsed: {msg}. Return a JSON object {{\"patch\": [...]}}.\n\n\
+                             REMINDER - Original Instruction: {original_instruction}\n\
+                             Fix the errors while ensuring the original instruction is still met."
+                        )));
+                        continue;
+                    }
                 }
             };
+
+            let ops_value = serde_json::to_value(patch_result.patch)?;
+            let mut patch: json_patch::Patch = serde_json::from_value(ops_value)?;
 
             if matches!(
                 self.config.array_strategy,
@@ -684,8 +715,9 @@ impl RefinementEngine {
 
     fn build_system_prompt(&self) -> String {
         let base = "You are a JSON Patch generator. Given the current JSON value and the target schema, \
-                    return ONLY a valid RFC6902 JSON Patch array that transforms the current value to \
-                    satisfy the instruction and schema. Do not wrap in code fences or prose.";
+                    return a JSON object with a 'patch' key containing an array of valid RFC6902 \
+                    operations that transforms the current value to satisfy the instruction and schema. \
+                    Do not wrap in code fences or prose.";
 
         let array_guidance = match self.config.array_strategy {
             ArrayPatchStrategy::ReplaceWhole => {
@@ -784,6 +816,11 @@ impl RefinementEngine {
 
 fn clean_patch_text(patch_text: &str) -> &str {
     let trimmed = patch_text.trim();
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            return &trimmed[start..=end];
+        }
+    }
     if let Some(start) = trimmed.find('[') {
         if let Some(end) = trimmed.rfind(']') {
             return &trimmed[start..=end];
