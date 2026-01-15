@@ -86,21 +86,11 @@ pub trait GeminiValidator {
 
 /// Recursively strip or normalize fields that Gemini strict schema mode does not support.
 pub fn clean_schema_for_gemini(value: &mut Value) {
-    debug!(
-        schema_before = %serde_json::to_string_pretty(value).unwrap_or_default(),
-        "Schema before cleaning"
-    );
-
     let snapshot = value.clone();
     let mut stack = Vec::new();
 
     inline_refs(value, &snapshot, &mut stack);
     clean_schema_node(value);
-
-    debug!(
-        schema_after = %serde_json::to_string_pretty(value).unwrap_or_default(),
-        "Schema after cleaning"
-    );
 }
 
 /// Strip x-* custom fields from a schema before sending to Gemini.
