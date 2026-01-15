@@ -681,25 +681,34 @@ pub fn normalize_json_response(value: &mut Value) {
 
 /// Helper to check if a schema node allows a specific string value.
 /// Used to match collapsed string values against schema constraints.
-fn schema_matches_string_value(schema: &Value, target: &str) -> bool {
+fn schema_matches_string_value(schema: &Value, target: &str) -> Option<String> {
     // Case 1: "const": "mstl"
     if let Some(c) = schema.get("const").and_then(|v| v.as_str()) {
-        return c == target;
+        if c.eq_ignore_ascii_case(target) {
+            return Some(c.to_string());
+        }
     }
 
     // Case 2: "enum": ["mstl", "auto", "ets"]
     if let Some(enums) = schema.get("enum").and_then(|v| v.as_array()) {
-        return enums.iter().any(|e| e.as_str() == Some(target));
+        for e in enums {
+            if let Some(e_str) = e.as_str() {
+                if e_str.eq_ignore_ascii_case(target) {
+                    return Some(e_str.to_string());
+                }
+            }
+        }
     }
 
-    false
+    None
 }
 
 fn array_to_object_by_properties(
     arr: &mut Vec<Value>,
     props: &Map<String, Value>,
+    required_len: usize,
 ) -> Option<Value> {
-    if arr.is_empty() || arr.len() > props.len() {
+    if arr.is_empty() || arr.len() > props.len() || arr.len() < required_len {
         return None;
     }
 
@@ -721,7 +730,7 @@ fn array_to_object_by_properties(
 fn variant_properties_for_array<'a>(
     variants: &'a [Value],
     arr_len: usize,
-) -> Option<&'a Map<String, Value>> {
+) -> Option<(&'a Map<String, Value>, usize)> {
     let mut fallback = None;
 
     for variant in variants {
@@ -734,17 +743,17 @@ fn variant_properties_for_array<'a>(
             continue;
         }
 
-        if arr_len == props.len() {
-            return Some(props);
-        }
-
         let required_len = variant
             .get("required")
             .and_then(|r| r.as_array())
             .map_or(0, |r| r.len());
 
+        if arr_len == props.len() {
+            return Some((props, required_len));
+        }
+
         if arr_len >= required_len && fallback.is_none() {
-            fallback = Some(props);
+            fallback = Some((props, required_len));
         }
     }
 
@@ -763,7 +772,11 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
     match value {
         Value::Array(arr) => {
             if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-                if let Some(obj) = array_to_object_by_properties(arr, props) {
+                let required_len = schema
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map_or(0, |r| r.len());
+                if let Some(obj) = array_to_object_by_properties(arr, props, required_len) {
                     *value = obj;
                     return;
                 }
@@ -772,8 +785,10 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
                 .or_else(|| schema.get("oneOf"))
                 .and_then(|v| v.as_array())
             {
-                if let Some(props) = variant_properties_for_array(variants, arr.len()) {
-                    if let Some(obj) = array_to_object_by_properties(arr, props) {
+                if let Some((props, required_len)) =
+                    variant_properties_for_array(variants, arr.len())
+                {
+                    if let Some(obj) = array_to_object_by_properties(arr, props, required_len) {
                         *value = obj;
                         return;
                     }
@@ -823,6 +838,24 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
                         }
                     }
                 }
+                let keys: Vec<String> = map.keys().cloned().collect();
+                let mut visited = HashSet::new();
+
+                for variant in variants {
+                    if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
+                        for key in &keys {
+                            if visited.contains(key) {
+                                continue;
+                            }
+                            if let Some(sub_schema) = props.get(key) {
+                                if let Some(value) = map.get_mut(key) {
+                                    recover_internally_tagged_enums(value, sub_schema);
+                                    visited.insert(key.clone());
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // Handle Normalized Maps: Data is Object, but Schema is Gemini KV-Array
             // ({type: "array", items: {properties: {__key__, __value__}}})
@@ -858,13 +891,13 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
                     if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
                         for (prop_name, prop_schema) in props {
                             // Does this property match our string?
-                            if schema_matches_string_value(prop_schema, s) {
+                            if let Some(matched) = schema_matches_string_value(prop_schema, s) {
                                 // Found it! Transform "val" -> { "tag": "val" }
                                 debug!(
                                     "Recovering internally tagged enum: expanded string '{}' to object with tag '{}'",
                                     s, prop_name
                                 );
-                                *value = json!({ prop_name: s });
+                                *value = json!({ prop_name: matched });
                                 return;
                             }
                         }
@@ -875,12 +908,12 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
             // Also check the root properties case (less common for enums but possible)
             if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
                 for (prop_name, prop_schema) in props {
-                    if schema_matches_string_value(prop_schema, s) {
+                    if let Some(matched) = schema_matches_string_value(prop_schema, s) {
                         // Check if this property is REQUIRED. If so, and we only have a string,
                         // the LLM likely collapsed the object to this single identifying property.
                         if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
                             if req.contains(&json!(prop_name)) {
-                                *value = json!({ prop_name: s });
+                                *value = json!({ prop_name: matched });
                                 return;
                             }
                         }
