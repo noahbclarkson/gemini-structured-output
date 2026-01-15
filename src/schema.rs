@@ -753,6 +753,12 @@ struct EnumInfo {
     is_externally_tagged: bool,
 }
 
+#[derive(Debug, Clone)]
+struct VariantMatch {
+    variant: VariantInfo,
+    single_field_key: Option<String>,
+}
+
 /// Extract enum information from an anyOf schema (or x-anyOf-original if the schema was flattened)
 fn extract_enum_info(schema: &Value) -> Option<EnumInfo> {
     // Check for x-anyOf-original first (flattened enums) then fall back to anyOf
@@ -995,6 +1001,47 @@ pub fn unflatten_externally_tagged_enums(value: &mut Value, schema: &Value) {
     }
 }
 
+fn extract_variant_data_from_map(
+    map: &mut serde_json::Map<String, Value>,
+    variant: &VariantInfo,
+) -> serde_json::Map<String, Value> {
+    let mut variant_data = serde_json::Map::new();
+
+    for field in &variant.all_fields {
+        // Try exact match first
+        if let Some(field_value) = map.remove(field) {
+            variant_data.insert(field.clone(), field_value);
+        } else {
+            // Try case-insensitive match with normalization (handles camelCase vs snake_case)
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                if is_variant_discriminator_match(&key, field) {
+                    if let Some(field_value) = map.remove(&key) {
+                        // Use the schema field name, not the JSON key name
+                        variant_data.insert(field.clone(), field_value);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    variant_data
+}
+
+fn unflatten_variant_data(variant_data: &mut serde_json::Map<String, Value>, variant: &VariantInfo) {
+    for (field_name, field_value) in variant_data.iter_mut() {
+        if let Some(field_schema) = variant.schema
+            .get("properties")
+            .and_then(|p| p.get(field_name))
+        {
+            if let Some(nested_enum_info) = extract_enum_info(field_schema) {
+                let _ = unflatten_enum_field(field_value, &nested_enum_info);
+            }
+        }
+    }
+}
+
 /// Unflatten a single enum field value
 fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result::Result<(), String> {
     let value_type = match value {
@@ -1025,13 +1072,49 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
             // Should become: {"model": {"Mstl": {"seasonalPeriods": [12], "trendModel": "Ets"}}}
 
             // Try to identify which variant this represents
-            let matched_variant = identify_variant_from_fields(map, &enum_info.variants)?;
+            let VariantMatch {
+                variant: matched_variant,
+                single_field_key,
+            } = identify_variant_from_fields(map, &enum_info.variants)?;
 
             tracing::trace!(
                 matched_variant = %matched_variant.name,
                 variant_fields = ?matched_variant.all_fields,
                 "Identified variant"
             );
+
+            if let Some(single_field_key) = single_field_key {
+                if map.len() == 1 {
+                    if let Some(mut inner_value) = map.remove(&single_field_key) {
+                        if matched_variant.is_newtype {
+                            if let Some(nested_enum_info) = extract_enum_info(&matched_variant.schema) {
+                                let _ = unflatten_enum_field(&mut inner_value, &nested_enum_info);
+                            }
+
+                            let mut variant_map = serde_json::Map::new();
+                            variant_map.insert(matched_variant.name.clone(), inner_value);
+                            *value = Value::Object(variant_map);
+                            return Ok(());
+                        }
+
+                        if let Value::Object(mut inner_map) = inner_value {
+                            let mut variant_data =
+                                extract_variant_data_from_map(&mut inner_map, &matched_variant);
+                            unflatten_variant_data(&mut variant_data, &matched_variant);
+
+                            let mut variant_map = serde_json::Map::new();
+                            variant_map.insert(
+                                matched_variant.name.clone(),
+                                Value::Object(variant_data),
+                            );
+                            *value = Value::Object(variant_map);
+                            return Ok(());
+                        }
+
+                        map.insert(single_field_key, inner_value);
+                    }
+                }
+            }
 
             // Special handling for nested enums:
             // If the variant has a single field and that field's value in the map is a string
@@ -1114,37 +1197,10 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
 
             // Standard externally-tagged enum restructuring
             // Extract the variant data
-            let mut variant_data = serde_json::Map::new();
-            for field in &matched_variant.all_fields {
-                // Try exact match first
-                if let Some(field_value) = map.remove(field) {
-                    variant_data.insert(field.clone(), field_value);
-                } else {
-                    // Try case-insensitive match with normalization (handles camelCase vs snake_case)
-                    let keys: Vec<String> = map.keys().cloned().collect();
-                    for key in keys {
-                        if is_variant_discriminator_match(&key, field) {
-                            if let Some(field_value) = map.remove(&key) {
-                                // Use the schema field name, not the JSON key name
-                                variant_data.insert(field.clone(), field_value);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            let mut variant_data = extract_variant_data_from_map(map, &matched_variant);
 
             // Recursively unflatten any nested enums in variant_data
-            for (field_name, field_value) in variant_data.iter_mut() {
-                if let Some(field_schema) = matched_variant.schema
-                    .get("properties")
-                    .and_then(|p| p.get(field_name))
-                {
-                    if let Some(nested_enum_info) = extract_enum_info(field_schema) {
-                        let _ = unflatten_enum_field(field_value, &nested_enum_info);
-                    }
-                }
-            }
+            unflatten_variant_data(&mut variant_data, &matched_variant);
 
             // Restructure as externally-tagged enum
             let mut variant_map = serde_json::Map::new();
@@ -1219,11 +1275,87 @@ fn is_variant_discriminator_match(value: &str, variant_name: &str) -> bool {
     normalize(value) == normalize(variant_name)
 }
 
+fn value_matches_schema_shape(value: &Value, schema: &Value) -> bool {
+    let any_of = schema
+        .get("x-anyOf-original")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(|v| v.as_array());
+
+    if let Some(variants) = any_of {
+        return variants
+            .iter()
+            .any(|variant| value_matches_schema_shape(value, variant));
+    }
+
+    if let Some(type_name) = schema.get("type").and_then(|v| v.as_str()) {
+        return match (type_name, value) {
+            ("object", Value::Object(_)) => true,
+            ("array", Value::Array(_)) => true,
+            ("string", Value::String(_)) => true,
+            ("number", Value::Number(_)) => true,
+            ("integer", Value::Number(n)) => n.is_i64() || n.is_u64(),
+            ("boolean", Value::Bool(_)) => true,
+            ("null", Value::Null) => true,
+            _ => false,
+        };
+    }
+
+    if schema.get("properties").is_some() {
+        return matches!(value, Value::Object(_));
+    }
+
+    if schema.get("enum").is_some() || schema.get("const").is_some() {
+        return matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_));
+    }
+
+    true
+}
+
+fn value_contains_variant_data(value: &Value, variant: &VariantInfo) -> bool {
+    if variant.is_unit {
+        return matches!(value, Value::Null) ||
+            matches!(value, Value::Object(map) if map.is_empty());
+    }
+
+    if variant.is_newtype {
+        return value_matches_schema_shape(value, &variant.schema);
+    }
+
+    let has_required = variant.schema.get("required").is_some();
+
+    match value {
+        Value::Object(map) => {
+            if variant.all_fields.is_empty() {
+                return true;
+            }
+
+            if has_required {
+                variant.identifying_fields.iter().all(|field| {
+                    map.keys()
+                        .any(|key| is_variant_discriminator_match(key, field))
+                })
+            } else {
+                variant.all_fields.iter().any(|field| {
+                    map.keys()
+                        .any(|key| is_variant_discriminator_match(key, field))
+                })
+            }
+        }
+        _ => false,
+    }
+}
+
+fn field_present(present_fields: &[String], field: &str) -> bool {
+    present_fields
+        .iter()
+        .any(|present| is_variant_discriminator_match(present, field))
+}
+
 /// Identify which variant a flattened object represents
 fn identify_variant_from_fields(
     map: &serde_json::Map<String, Value>,
     variants: &[VariantInfo],
-) -> std::result::Result<VariantInfo, String> {
+) -> std::result::Result<VariantMatch, String> {
     let present_fields: Vec<String> = map.keys().cloned().collect();
 
     tracing::trace!(
@@ -1251,7 +1383,10 @@ fn identify_variant_from_fields(
                 variant_name = %unit_variant.name,
                 "Matched empty object to unit variant"
             );
-            return Ok((*unit_variant).clone());
+            return Ok(VariantMatch {
+                variant: (*unit_variant).clone(),
+                single_field_key: None,
+            });
         }
     }
 
@@ -1267,13 +1402,20 @@ fn identify_variant_from_fields(
                 let has_same_name_field = variant.all_fields.iter()
                     .any(|f| is_variant_discriminator_match(f, field_name));
 
-                if !has_same_name_field {
+                if (!has_same_name_field || variant.is_newtype)
+                    && map.get(field_name)
+                        .map(|value| value_contains_variant_data(value, variant))
+                        .unwrap_or(false)
+                {
                     tracing::trace!(
                         field_name = %field_name,
                         variant_name = %variant.name,
                         "Matched single field name to variant (no field collision)"
                     );
-                    return Ok(variant.clone());
+                    return Ok(VariantMatch {
+                        variant: variant.clone(),
+                        single_field_key: Some(field_name.clone()),
+                    });
                 }
             }
         }
@@ -1295,12 +1437,16 @@ fn identify_variant_from_fields(
                         .collect();
 
                     let matches = other_fields.iter().all(|f| {
-                        variant.all_fields.contains(f) ||
-                        variant.all_fields.iter().any(|vf| vf.eq_ignore_ascii_case(f))
+                        variant.all_fields
+                            .iter()
+                            .any(|vf| is_variant_discriminator_match(vf, f))
                     });
 
                     if matches || other_fields.is_empty() {
-                        return Ok(variant.clone());
+                        return Ok(VariantMatch {
+                            variant: variant.clone(),
+                            single_field_key: None,
+                        });
                     }
                 }
             }
@@ -1314,17 +1460,11 @@ fn identify_variant_from_fields(
 
     for variant in variants {
         let required_present = variant.identifying_fields.iter()
-            .filter(|f| {
-                present_fields.contains(f) ||
-                present_fields.iter().any(|pf| pf.eq_ignore_ascii_case(f))
-            })
+            .filter(|f| field_present(&present_fields, f))
             .count();
 
         let all_present = variant.all_fields.iter()
-            .filter(|f| {
-                present_fields.contains(f) ||
-                present_fields.iter().any(|pf| pf.eq_ignore_ascii_case(f))
-            })
+            .filter(|f| field_present(&present_fields, f))
             .count();
 
         // Score: prioritize variants where all required fields are present
@@ -1349,20 +1489,23 @@ fn identify_variant_from_fields(
         if variant.all_fields.len() == 1 {
             // Single-field variant - could have nested enum
             // Accept even if there are extra fields
-            return Ok(variant.clone());
+            return Ok(VariantMatch {
+                variant: variant.clone(),
+                single_field_key: None,
+            });
         } else if best_score >= 1000 {
             // All required fields matched
-            return Ok(variant.clone());
+            return Ok(VariantMatch {
+                variant: variant.clone(),
+                single_field_key: None,
+            });
         }
     }
 
     // Strategy 3: If all else fails, find variant with most overlapping fields
     for variant in variants {
         let overlap = variant.all_fields.iter()
-            .filter(|f| {
-                present_fields.contains(f) ||
-                present_fields.iter().any(|pf| pf.eq_ignore_ascii_case(f))
-            })
+            .filter(|f| field_present(&present_fields, f))
             .count();
 
         if overlap > best_score {
@@ -1373,6 +1516,10 @@ fn identify_variant_from_fields(
 
     best_match
         .cloned()
+        .map(|variant| VariantMatch {
+            variant,
+            single_field_key: None,
+        })
         .ok_or_else(|| format!("Could not identify variant from fields: {:?}", present_fields))
 }
 
