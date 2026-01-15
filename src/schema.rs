@@ -93,6 +93,7 @@ pub fn clean_schema_for_gemini(value: &mut Value) {
 
     let snapshot = value.clone();
     let mut stack = Vec::new();
+
     inline_refs(value, &snapshot, &mut stack);
     clean_schema_node(value);
 
@@ -201,6 +202,9 @@ fn merge_tag_field(existing: &mut Value, new_variant: &Value) {
 /// This allows Gemini to understand enum types by flattening all variant properties
 /// into a single schema with the tag field containing all possible values.
 fn flatten_variants(parent: &mut Map<String, Value>, variants: Vec<Value>) {
+    // Store the original anyOf structure so we can unflatten later
+    parent.insert("x-anyOf-original".to_string(), json!(variants));
+
     // Force type to object
     parent.insert("type".to_string(), json!("object"));
 
@@ -601,6 +605,9 @@ fn clean_object_node(map: &mut Map<String, Value>) -> bool {
             .is_some_and(|o| !o.is_empty());
 
         if !has_specific_props && add_props.is_object() {
+            // Store the original additionalProperties so we can use it later for unflattening
+            map.insert("x-additionalProperties-original".to_string(), add_props.clone());
+
             map.insert("type".to_string(), json!("array"));
             map.insert(
                 "items".to_string(),
@@ -706,6 +713,589 @@ pub fn prune_null_fields(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// Information about an enum variant extracted from the schema
+#[derive(Debug, Clone)]
+struct VariantInfo {
+    /// The variant name as it appears in the schema (e.g., "Mstl", "Auto")
+    name: String,
+    /// Field names that uniquely identify this variant
+    identifying_fields: Vec<String>,
+    /// All fields that belong to this variant
+    all_fields: Vec<String>,
+    /// Whether this is a unit variant (no fields)
+    is_unit: bool,
+    /// Whether this is a newtype variant (single unnamed field)
+    is_newtype: bool,
+    /// The schema for this variant's data
+    schema: Value,
+}
+
+/// Information about an enum extracted from the schema
+#[derive(Debug, Clone)]
+struct EnumInfo {
+    /// All variants of this enum
+    variants: Vec<VariantInfo>,
+    /// Whether this is an externally-tagged enum (default serde representation)
+    is_externally_tagged: bool,
+}
+
+/// Extract enum information from an anyOf schema (or x-anyOf-original if the schema was flattened)
+fn extract_enum_info(schema: &Value) -> Option<EnumInfo> {
+    // Check for x-anyOf-original first (flattened enums) then fall back to anyOf
+    let any_of = schema
+        .get("x-anyOf-original")
+        .or_else(|| schema.get("anyOf"))
+        ?.as_array()?;
+
+    // Check if this is an Option<Enum> wrapper - if any variant itself has anyOf/x-anyOf-original,
+    // we should unwrap and use those inner variants instead
+    for variant_schema in any_of {
+        if variant_schema.get("anyOf").is_some() || variant_schema.get("x-anyOf-original").is_some() {
+            // This variant is itself an enum - unwrap and use it directly
+            return extract_enum_info(variant_schema);
+        }
+    }
+
+    let mut variants = Vec::new();
+
+    for variant_schema in any_of {
+        if let Some(variant) = extract_variant_info(variant_schema) {
+            variants.push(variant);
+        } else if let Some(string_val) = variant_schema.get("enum").and_then(|v| v.as_array()) {
+            // Handle unit variants represented as string enums
+            for unit_variant in string_val {
+                if let Some(name) = unit_variant.as_str() {
+                    variants.push(VariantInfo {
+                        name: name.to_string(),
+                        identifying_fields: vec![],
+                        all_fields: vec![],
+                        is_unit: true,
+                        is_newtype: false,
+                        schema: variant_schema.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    if variants.is_empty() {
+        return None;
+    }
+
+    // Detect if this is externally-tagged by checking if variants have single-key objects
+    // An externally-tagged enum has variants where each variant is represented as
+    // an object with a single key (the variant name)
+    let is_externally_tagged = variants.iter().any(|v| !v.is_unit);
+
+    tracing::trace!(
+        variants_count = variants.len(),
+        is_externally_tagged = is_externally_tagged,
+        "Extracted enum info"
+    );
+
+    Some(EnumInfo {
+        variants,
+        is_externally_tagged,
+    })
+}
+
+/// Extract information about a single variant from its schema
+fn extract_variant_info(schema: &Value) -> Option<VariantInfo> {
+    let props = schema.get("properties")?.as_object()?;
+
+    // For externally-tagged enums, there should be exactly one top-level property
+    // which is the variant name
+    if props.len() == 1 {
+        let (variant_name, variant_schema) = props.iter().next()?;
+
+        // Check if this variant has fields
+        if let Some(variant_props) = variant_schema.get("properties").and_then(|v| v.as_object()) {
+            let all_fields: Vec<String> = variant_props.keys().cloned().collect();
+            let variant_required = variant_schema.get("required")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| all_fields.clone());
+
+            return Some(VariantInfo {
+                name: variant_name.clone(),
+                identifying_fields: variant_required.clone(),
+                all_fields,
+                is_unit: false,
+                is_newtype: false,
+                schema: variant_schema.clone(),
+            });
+        } else if variant_schema.get("anyOf").is_some() {
+            // Newtype variant wrapping another enum (e.g., Model(ForecastModel))
+            // This is a single-field variant where the field value is itself an enum
+            return Some(VariantInfo {
+                name: variant_name.clone(),
+                identifying_fields: vec![variant_name.clone()],
+                all_fields: vec![variant_name.clone()],
+                is_unit: false,
+                is_newtype: true,
+                schema: variant_schema.clone(),
+            });
+        } else if variant_schema.get("type").and_then(|v| v.as_str()) == Some("string") {
+            // Unit variant represented as string or string enum
+            return Some(VariantInfo {
+                name: variant_name.clone(),
+                identifying_fields: vec![],
+                all_fields: vec![],
+                is_unit: true,
+                is_newtype: false,
+                schema: variant_schema.clone(),
+            });
+        } else {
+            // Other newtype variant (single unnamed field)
+            return Some(VariantInfo {
+                name: variant_name.clone(),
+                identifying_fields: vec![variant_name.clone()],
+                all_fields: vec![variant_name.clone()],
+                is_unit: false,
+                is_newtype: true,
+                schema: variant_schema.clone(),
+            });
+        }
+    }
+
+    None
+}
+
+/// Unflatten externally-tagged enums that Gemini has collapsed
+///
+/// Gemini Strict Mode often outputs flattened enum structures like:
+/// ```json
+/// {"model": "mstl", "seasonalPeriods": [12], "trendModel": "ets"}
+/// ```
+///
+/// But serde's externally-tagged enums expect:
+/// ```json
+/// {"model": {"Mstl": {"seasonalPeriods": [12], "trendModel": "Ets"}}}
+/// ```
+///
+/// This function detects these patterns and restructures them.
+pub fn unflatten_externally_tagged_enums(value: &mut Value, schema: &Value) {
+    // First check if the value itself is a flattened enum (schema has anyOf at root)
+    if let Some(enum_info) = extract_enum_info(schema) {
+        if let Err(e) = unflatten_enum_field(value, &enum_info) {
+            tracing::debug!(
+                error = %e,
+                "Failed to unflatten root enum value"
+            );
+        }
+        return;
+    }
+
+    // Special case: value is Object but schema is Array with x-additionalProperties-original
+    // This happens with HashMaps after normalize_json_response converts them from arrays back to objects
+    if let Value::Object(map) = value {
+        if schema.get("type").and_then(|t| t.as_str()) == Some("array") {
+            if let Some(original_additional_props) = schema.get("x-additionalProperties-original") {
+                tracing::trace!(
+                    keys_count = map.keys().len(),
+                    "Handling HashMap (normalized from array) - recursing into values with x-additionalProperties-original"
+                );
+                // This is a HashMap - recurse into each value with the original additionalProperties schema
+                let keys: Vec<String> = map.keys().cloned().collect();
+                for key in keys {
+                    if let Some(v) = map.get_mut(&key) {
+                        unflatten_externally_tagged_enums(v, original_additional_props);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    match value {
+        Value::Object(map) => {
+            // First, recursively process nested values
+            let keys: Vec<String> = map.keys().cloned().collect();
+            tracing::trace!(
+                keys_count = keys.len(),
+                keys = ?keys,
+                has_properties = schema.get("properties").is_some(),
+                has_additional_properties = schema.get("additionalProperties").is_some(),
+                "Processing object keys"
+            );
+            for key in &keys {
+                if let Some(v) = map.get_mut(key) {
+                    if let Some(prop_schema) = schema
+                        .get("properties")
+                        .and_then(|p| p.get(key))
+                    {
+                        tracing::trace!(key = %key, "Found key in schema properties, recursing");
+                        unflatten_externally_tagged_enums(v, prop_schema);
+                    } else {
+                        // No schema for this property - recurse without schema guidance
+                        // This handles dynamically-keyed maps like HashMap<String, Value>
+                        match v {
+                            Value::Object(_) | Value::Array(_) => {
+                                // Try to find if this is a map-type schema (additionalProperties or x-additionalProperties-original)
+                                let additional_props_schema = schema
+                                    .get("additionalProperties")
+                                    .or_else(|| schema.get("x-additionalProperties-original"));
+
+                                if let Some(additional_props_schema) = additional_props_schema {
+                                    tracing::trace!(
+                                        key = %key,
+                                        "Recursing into HashMap value with additionalProperties schema"
+                                    );
+                                    unflatten_externally_tagged_enums(v, additional_props_schema);
+                                } else {
+                                    tracing::trace!(
+                                        key = %key,
+                                        "No additionalProperties schema found for HashMap-like key"
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // Note: The recursive first pass above already handles unflattening enum fields
+            // by calling unflatten_externally_tagged_enums on each field, which checks if
+            // the field's schema has anyOf and calls unflatten_enum_field if needed.
+            // A second pass here would cause double-processing and corrupt already-unflattened values.
+        }
+        Value::Array(arr) => {
+            // Recursively process array elements
+            // We need to be careful here - we don't know the schema for array items
+            // without more context
+            for item in arr {
+                if let Value::Object(_) = item {
+                    if let Some(items_schema) = schema.get("items") {
+                        unflatten_externally_tagged_enums(item, items_schema);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Unflatten a single enum field value
+fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result::Result<(), String> {
+    let value_type = match value {
+        Value::Object(_) => "object",
+        Value::Array(_) => "array",
+        Value::String(_) => "string",
+        _ => "other",
+    };
+
+    tracing::trace!(
+        is_externally_tagged = enum_info.is_externally_tagged,
+        variants_count = enum_info.variants.len(),
+        value_type = value_type,
+        "Unflattening enum field"
+    );
+
+    if !enum_info.is_externally_tagged {
+        // Only handle externally-tagged enums for now
+        tracing::trace!("Skipping non-externally-tagged enum");
+        return Ok(());
+    }
+
+    match value {
+        Value::Object(map) => {
+            tracing::trace!(field_count = map.len(), "Processing object value");
+            // Case 1: Flattened nested enum
+            // {"model": "mstl", "seasonalPeriods": [12], "trendModel": "ets"}
+            // Should become: {"model": {"Mstl": {"seasonalPeriods": [12], "trendModel": "Ets"}}}
+
+            // Try to identify which variant this represents
+            let matched_variant = identify_variant_from_fields(map, &enum_info.variants)?;
+
+            tracing::trace!(
+                matched_variant = %matched_variant.name,
+                variant_fields = ?matched_variant.all_fields,
+                "Identified variant"
+            );
+
+            // Special handling for nested enums:
+            // If the variant has a single field and that field's value in the map is a string
+            // that doesn't match the variant name, it might be a nested enum discriminator
+            if matched_variant.all_fields.len() == 1 {
+                let field_name = &matched_variant.all_fields[0];
+
+                tracing::trace!(
+                    single_field = %field_name,
+                    has_properties = matched_variant.schema.get("properties").is_some(),
+                    "Checking for nested enum in single-field variant"
+                );
+
+                // For newtype variants wrapping an enum, the schema itself is the enum schema
+                // (it has anyOf directly, not inside properties)
+                let field_schema = if matched_variant.is_newtype && matched_variant.schema.get("anyOf").is_some() {
+                    Some(&matched_variant.schema)
+                } else {
+                    matched_variant.schema
+                        .get("properties")
+                        .and_then(|p| p.get(field_name))
+                };
+
+                if let Some(field_schema) = field_schema {
+                    // Check if this field's schema is also an enum (has anyOf)
+                    if let Some(nested_enum_info) = extract_enum_info(field_schema) {
+                        tracing::trace!(
+                            field = %field_name,
+                            nested_variants = nested_enum_info.variants.len(),
+                            "Found nested enum in variant field"
+                        );
+
+                        // The current map might have:
+                        // Field from outer variant (e.g., "model") with a string value that's actually
+                        // a discriminator for the inner enum, PLUS fields from the inner enum's variant
+
+                        // Strategy: Remove the outer field, treat remaining fields as the nested enum
+                        let discriminator_value = map.get(field_name).and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                        tracing::trace!(
+                            discriminator_field = %field_name,
+                            discriminator_value = ?discriminator_value,
+                            all_fields = ?map.keys().collect::<Vec<_>>(),
+                            "Processing nested enum with discriminator"
+                        );
+
+                        // Remove the discriminator field from map and collect remaining fields
+                        map.remove(field_name);
+
+                        tracing::trace!(
+                            remaining_fields = ?map.keys().collect::<Vec<_>>(),
+                            "Fields after removing discriminator"
+                        );
+
+                        // The remaining fields should form the nested enum
+                        let mut nested_value = Value::Object(map.clone());
+
+                        // Recursively unflatten the nested enum
+                        if unflatten_enum_field(&mut nested_value, &nested_enum_info).is_ok() {
+                            // Successfully unflattened the nested enum
+                            // Now wrap it in the outer variant
+                            let mut variant_map = serde_json::Map::new();
+                            variant_map.insert(matched_variant.name.clone(), nested_value);
+                            *value = Value::Object(variant_map);
+
+                            tracing::trace!(
+                                outer_variant = %matched_variant.name,
+                                "Successfully restructured nested enum"
+                            );
+                            return Ok(());
+                        } else {
+                            // Restore the discriminator field if unflatten failed
+                            if let Some(disc_val) = discriminator_value {
+                                map.insert(field_name.clone(), Value::String(disc_val));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Standard externally-tagged enum restructuring
+            // Extract the variant data
+            let mut variant_data = serde_json::Map::new();
+            for field in &matched_variant.all_fields {
+                if let Some(field_value) = map.remove(field) {
+                    variant_data.insert(field.clone(), field_value);
+                }
+            }
+
+            // Recursively unflatten any nested enums in variant_data
+            for (field_name, field_value) in variant_data.iter_mut() {
+                if let Some(field_schema) = matched_variant.schema
+                    .get("properties")
+                    .and_then(|p| p.get(field_name))
+                {
+                    if let Some(nested_enum_info) = extract_enum_info(field_schema) {
+                        let _ = unflatten_enum_field(field_value, &nested_enum_info);
+                    }
+                }
+            }
+
+            // Restructure as externally-tagged enum
+            let mut variant_map = serde_json::Map::new();
+
+            if matched_variant.is_unit {
+                // Unit variant - the value should just be the variant name as a string
+                *value = Value::String(matched_variant.name.clone());
+            } else if matched_variant.is_newtype && variant_data.is_empty() {
+                // Newtype variant - check if there's a single non-variant-name field
+                // This is tricky - we need to identify the wrapped value
+                // For now, keep the structure as-is
+                return Ok(());
+            } else {
+                // Struct variant
+                variant_map.insert(matched_variant.name.clone(), Value::Object(variant_data));
+                *value = Value::Object(variant_map);
+            }
+
+            Ok(())
+        }
+        Value::String(s) => {
+            // Already a unit variant string - might need case conversion
+            // Check if this matches any variant name (case-insensitive)
+            for variant in &enum_info.variants {
+                if variant.is_unit && s.eq_ignore_ascii_case(&variant.name) {
+                    // Update to correct case
+                    *s = variant.name.clone();
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+        Value::Array(arr) => {
+            // Array format for tuple struct
+            // ["value1", "value2"] should become {"VariantName": {"field1": "value1", "field2": "value2"}}
+
+            // Try to match array length to variant field count
+            for variant in &enum_info.variants {
+                if variant.all_fields.len() == arr.len() {
+                    let mut variant_data = serde_json::Map::new();
+                    for (field_name, field_value) in variant.all_fields.iter().zip(arr.iter()) {
+                        variant_data.insert(field_name.clone(), field_value.clone());
+                    }
+
+                    let mut variant_map = serde_json::Map::new();
+                    variant_map.insert(variant.name.clone(), Value::Object(variant_data));
+                    *value = Value::Object(variant_map);
+
+                    return Ok(());
+                }
+            }
+
+            Err(format!("Could not match array of length {} to any variant", arr.len()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Identify which variant a flattened object represents
+fn identify_variant_from_fields(
+    map: &serde_json::Map<String, Value>,
+    variants: &[VariantInfo],
+) -> std::result::Result<VariantInfo, String> {
+    let present_fields: Vec<String> = map.keys().cloned().collect();
+
+    tracing::trace!(
+        present_fields = ?present_fields,
+        variants_count = variants.len(),
+        "Identifying variant from fields"
+    );
+
+    for (i, variant) in variants.iter().enumerate() {
+        tracing::trace!(
+            variant_index = i,
+            variant_name = %variant.name,
+            variant_fields = ?variant.all_fields,
+            variant_required = ?variant.identifying_fields,
+            is_unit = variant.is_unit,
+            "Checking variant"
+        );
+    }
+
+    // Strategy 1: Look for a discriminator field that matches a variant name
+    // Common patterns: "model": "mstl", "type": "auto", etc.
+    for (key, value) in map.iter() {
+        if let Some(s) = value.as_str() {
+            // Check if this string value matches a variant name
+            for variant in variants {
+                if s.eq_ignore_ascii_case(&variant.name) {
+                    // Found a discriminator! This is likely the variant
+                    // Verify that other fields match
+                    let other_fields: Vec<_> = present_fields.iter()
+                        .filter(|f| *f != key)
+                        .cloned()
+                        .collect();
+
+                    let matches = other_fields.iter().all(|f| {
+                        variant.all_fields.contains(f) ||
+                        variant.all_fields.iter().any(|vf| vf.eq_ignore_ascii_case(f))
+                    });
+
+                    if matches || other_fields.is_empty() {
+                        return Ok(variant.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Match based on field presence (with tolerance for nested enum fields)
+    // Find the variant whose required fields are all present
+    let mut best_match: Option<&VariantInfo> = None;
+    let mut best_score = 0;
+
+    for variant in variants {
+        let required_present = variant.identifying_fields.iter()
+            .filter(|f| {
+                present_fields.contains(f) ||
+                present_fields.iter().any(|pf| pf.eq_ignore_ascii_case(f))
+            })
+            .count();
+
+        let all_present = variant.all_fields.iter()
+            .filter(|f| {
+                present_fields.contains(f) ||
+                present_fields.iter().any(|pf| pf.eq_ignore_ascii_case(f))
+            })
+            .count();
+
+        // Score: prioritize variants where all required fields are present
+        // Special handling: if all required fields are present, this could be a match
+        // even if there are extra fields (which might belong to a nested enum)
+        let score = if required_present == variant.identifying_fields.len() {
+            // All required fields match - give high score
+            required_present * 1000 + all_present * 10
+        } else {
+            // Not all required fields present - low score
+            all_present
+        };
+
+        if score > best_score {
+            best_score = score;
+            best_match = Some(variant);
+        }
+    }
+
+    if let Some(variant) = best_match {
+        // Additional validation: check if extra fields might belong to a nested enum
+        if variant.all_fields.len() == 1 {
+            // Single-field variant - could have nested enum
+            // Accept even if there are extra fields
+            return Ok(variant.clone());
+        } else if best_score >= 1000 {
+            // All required fields matched
+            return Ok(variant.clone());
+        }
+    }
+
+    // Strategy 3: If all else fails, find variant with most overlapping fields
+    for variant in variants {
+        let overlap = variant.all_fields.iter()
+            .filter(|f| {
+                present_fields.contains(f) ||
+                present_fields.iter().any(|pf| pf.eq_ignore_ascii_case(f))
+            })
+            .count();
+
+        if overlap > best_score {
+            best_score = overlap;
+            best_match = Some(variant);
+        }
+    }
+
+    best_match
+        .cloned()
+        .ok_or_else(|| format!("Could not identify variant from fields: {:?}", present_fields))
 }
 
 /// Helper to check if a schema node allows a specific string value.

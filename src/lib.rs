@@ -2,6 +2,7 @@
 //!
 //! This crate wraps schema generation, prompt assembly, caching and refinement loops
 //! into a simpler interface for application code.
+//! (Touched to force rebuild)
 //!
 //! # Quick Start
 //!

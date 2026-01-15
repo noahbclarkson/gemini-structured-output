@@ -277,6 +277,107 @@ async fn test_prune_nulls_from_flattened_enum() {
     }
 }
 
+#[tokio::test]
+async fn test_unflatten_nested_enums_real_data() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("trace")
+        .with_test_writer()
+        .try_init();
+
+    let mut gemini_response = serde_json::json!({
+        "pnlConfig": {
+            "forecastConfig": {
+                "periodsToForecast": 12,
+                "defaultModel": "Auto",
+                "fallbackModel": "LastValue",
+                "accountOverrides": {
+                    "Revenue - Sales": {
+                        "processor": {
+                            "model": "mstl",
+                            "seasonalPeriods": [12],
+                            "trendModel": "ets"
+                        },
+                        "isNonCash": false,
+                        "constraints": { "nonNegative": true }
+                    },
+                    "Cost Account": {
+                        "processor": {
+                            "calculation": {
+                                "steps": [
+                                    {
+                                        "operand": { "constant": 100.0 },
+                                        "operator": "multiply"
+                                    }
+                                ]
+                            }
+                        },
+                        "isNonCash": false,
+                        "constraints": { "nonNegative": false }
+                    }
+                }
+            }
+        },
+        "historicalPeriodsToFetch": 24,
+        "bsConfig": {
+            "accountOverrides": {}
+        },
+        "fiscalYearEndMonth": 3,
+        "cashFlowConfig": {}
+    });
+
+    println!("\n📋 Original Gemini Response (flattened nested enum):");
+    println!("{}", serde_json::to_string_pretty(&gemini_response).unwrap());
+
+    let schema = FullForecastConfig::gemini_schema();
+
+    println!("\n🔍 Top-level schema keys: {:?}", schema.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+
+    gemini_structured_output::schema::normalize_json_response(&mut gemini_response);
+    println!("\n🔄 After normalize:");
+    println!("{}", serde_json::to_string_pretty(&gemini_response).unwrap());
+
+    gemini_structured_output::schema::prune_null_fields(&mut gemini_response);
+    println!("\n✂️  After prune_nulls:");
+    println!("{}", serde_json::to_string_pretty(&gemini_response).unwrap());
+
+    gemini_structured_output::schema::unflatten_externally_tagged_enums(&mut gemini_response, &schema);
+    println!("\n🔧 After unflatten_externally_tagged_enums:");
+    println!("{}", serde_json::to_string_pretty(&gemini_response).unwrap());
+
+    gemini_structured_output::schema::recover_internally_tagged_enums(&mut gemini_response, &schema);
+    println!("\n🎯 After recover_internally_tagged_enums:");
+    println!("{}", serde_json::to_string_pretty(&gemini_response).unwrap());
+
+    let result = serde_json::from_value::<FullForecastConfig>(gemini_response);
+
+    match result {
+        Ok(config) => {
+            println!("\n✅ Deserialization Successful!");
+
+            let overrides = &config.pnl_config.forecast_config.account_overrides;
+            assert_eq!(overrides.len(), 2, "Expected 2 account overrides");
+
+            let revenue_override = overrides.get("Revenue - Sales").expect("Revenue account should exist");
+            assert!(matches!(
+                revenue_override.processor,
+                Some(PnlProcessor::Model(ForecastModel::Mstl { .. }))
+            ), "Revenue account should have Mstl model, got: {:?}", revenue_override.processor);
+
+            let cost_override = overrides.get("Cost Account").expect("Cost account should exist");
+            assert!(matches!(
+                cost_override.processor,
+                Some(PnlProcessor::Calculation { .. })
+            ), "Cost account should have Calculation processor");
+
+            println!("\n✅ All assertions passed! Nested enum unflattening works!");
+        }
+        Err(e) => {
+            eprintln!("\n❌ Deserialization Failed: {}", e);
+            panic!("Test failed: {}", e);
+        }
+    }
+}
+
 #[test]
 fn test_prune_null_fields_basic() {
     let mut value = serde_json::json!({
