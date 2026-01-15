@@ -1275,6 +1275,125 @@ fn is_variant_discriminator_match(value: &str, variant_name: &str) -> bool {
     normalize(value) == normalize(variant_name)
 }
 
+fn default_value_for_schema(schema: &Value) -> Value {
+    if let Some(default) = schema.get("default") {
+        return default.clone();
+    }
+
+    if let Some(const_val) = schema.get("const") {
+        return const_val.clone();
+    }
+
+    if let Some(enums) = schema.get("enum").and_then(|v| v.as_array()) {
+        if let Some(first) = enums.first() {
+            return first.clone();
+        }
+    }
+
+    if let Some(any_of) = schema
+        .get("anyOf")
+        .or_else(|| schema.get("oneOf"))
+        .and_then(|v| v.as_array())
+    {
+        if let Some(first) = any_of.first() {
+            return default_value_for_schema(first);
+        }
+    }
+
+    match schema.get("type").and_then(|v| v.as_str()) {
+        Some("string") => Value::String(String::new()),
+        Some("integer") | Some("number") => Value::Number(0.into()),
+        Some("boolean") => Value::Bool(false),
+        Some("array") => Value::Array(Vec::new()),
+        Some("object") => Value::Object(Map::new()),
+        Some("null") => Value::Null,
+        _ => Value::Null,
+    }
+}
+
+fn map_has_field(map: &Map<String, Value>, field: &str) -> bool {
+    map.keys()
+        .any(|key| is_variant_discriminator_match(key, field))
+}
+
+fn fill_required_fields_from_schema(variant: &VariantInfo, data: &mut Map<String, Value>) {
+    let props = match variant.schema.get("properties").and_then(|v| v.as_object()) {
+        Some(props) => props,
+        None => return,
+    };
+
+    for required_field in &variant.identifying_fields {
+        if map_has_field(data, required_field) {
+            continue;
+        }
+
+        if let Some(field_schema) = props.get(required_field) {
+            data.insert(
+                required_field.clone(),
+                default_value_for_schema(field_schema),
+            );
+        }
+    }
+}
+
+fn external_enum_value_from_string(value: &str, enum_info: &EnumInfo) -> Option<Value> {
+    let variant = enum_info
+        .variants
+        .iter()
+        .find(|v| is_variant_discriminator_match(value, &v.name))?;
+
+    if variant.is_unit {
+        return Some(Value::String(variant.name.clone()));
+    }
+
+    let mut variant_data = Map::new();
+    fill_required_fields_from_schema(variant, &mut variant_data);
+
+    Some(Value::Object({
+        let mut map = Map::new();
+        map.insert(variant.name.clone(), Value::Object(variant_data));
+        map
+    }))
+}
+
+fn external_enum_value_from_tagged_object(
+    map: &Map<String, Value>,
+    enum_info: &EnumInfo,
+) -> Option<Value> {
+    let (tag_key, tag_value) = map.iter().find_map(|(key, value)| {
+        let value = value.as_str()?;
+        if enum_info
+            .variants
+            .iter()
+            .any(|variant| is_variant_discriminator_match(value, &variant.name))
+        {
+            Some((key.clone(), value.to_string()))
+        } else {
+            None
+        }
+    })?;
+
+    let variant = enum_info
+        .variants
+        .iter()
+        .find(|v| is_variant_discriminator_match(&tag_value, &v.name))?;
+
+    if variant.is_unit {
+        return Some(Value::String(variant.name.clone()));
+    }
+
+    let mut remaining = map.clone();
+    remaining.remove(&tag_key);
+    let mut variant_data = extract_variant_data_from_map(&mut remaining, variant);
+    fill_required_fields_from_schema(variant, &mut variant_data);
+
+    Some(Value::Object({
+        let mut wrapped = Map::new();
+        wrapped.insert(variant.name.clone(), Value::Object(variant_data));
+        wrapped
+    }))
+}
+
 fn value_matches_schema_shape(value: &Value, schema: &Value) -> bool {
     let any_of = schema
         .get("x-anyOf-original")
@@ -1655,6 +1774,15 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
             }
         }
         Value::Object(map) => {
+            if let Some(enum_info) = extract_enum_info(schema) {
+                if enum_info.is_externally_tagged {
+                    if let Some(converted) = external_enum_value_from_tagged_object(map, &enum_info) {
+                        *value = converted;
+                        return;
+                    }
+                }
+            }
+
             // Handle standard objects: recurse into properties
             if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
                 for (k, v) in map {
@@ -1719,6 +1847,15 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
             }
         }
         Value::String(s) => {
+            if let Some(enum_info) = extract_enum_info(schema) {
+                if enum_info.is_externally_tagged {
+                    if let Some(converted) = external_enum_value_from_string(s, &enum_info) {
+                        *value = converted;
+                        return;
+                    }
+                }
+            }
+
             // THE FIX: Check if this string should actually be an object
             // This happens when serde(tag=...) is used and the LLM optimizes away the wrapper.
 
