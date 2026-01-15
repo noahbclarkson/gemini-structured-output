@@ -695,6 +695,62 @@ fn schema_matches_string_value(schema: &Value, target: &str) -> bool {
     false
 }
 
+fn array_to_object_by_properties(
+    arr: &mut Vec<Value>,
+    props: &Map<String, Value>,
+) -> Option<Value> {
+    if arr.is_empty() || arr.len() > props.len() {
+        return None;
+    }
+
+    let mut new_map = Map::new();
+    let mut iter = arr.drain(..);
+
+    for (key, sub_schema) in props {
+        if let Some(mut item) = iter.next() {
+            recover_internally_tagged_enums(&mut item, sub_schema);
+            new_map.insert(key.clone(), item);
+        } else {
+            break;
+        }
+    }
+
+    Some(Value::Object(new_map))
+}
+
+fn variant_properties_for_array<'a>(
+    variants: &'a [Value],
+    arr_len: usize,
+) -> Option<&'a Map<String, Value>> {
+    let mut fallback = None;
+
+    for variant in variants {
+        let props = match variant.get("properties").and_then(|p| p.as_object()) {
+            Some(props) => props,
+            None => continue,
+        };
+
+        if arr_len == 0 || arr_len > props.len() {
+            continue;
+        }
+
+        if arr_len == props.len() {
+            return Some(props);
+        }
+
+        let required_len = variant
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map_or(0, |r| r.len());
+
+        if arr_len >= required_len && fallback.is_none() {
+            fallback = Some(props);
+        }
+    }
+
+    fallback
+}
+
 /// Recursively attempts to recover internally tagged enums where the LLM
 /// output a string literal instead of the wrapper object.
 ///
@@ -706,6 +762,24 @@ fn schema_matches_string_value(schema: &Value, target: &str) -> bool {
 pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
     match value {
         Value::Array(arr) => {
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                if let Some(obj) = array_to_object_by_properties(arr, props) {
+                    *value = obj;
+                    return;
+                }
+            } else if let Some(variants) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(|v| v.as_array())
+            {
+                if let Some(props) = variant_properties_for_array(variants, arr.len()) {
+                    if let Some(obj) = array_to_object_by_properties(arr, props) {
+                        *value = obj;
+                        return;
+                    }
+                }
+            }
+
             // Handle arrays: check if schema defines items
             if let Some(items_schema) = schema.get("items") {
                 for item in arr {
@@ -727,6 +801,26 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
                 for (k, v) in map {
                     if let Some(sub_schema) = props.get(k) {
                         recover_internally_tagged_enums(v, sub_schema);
+                    }
+                }
+            }
+            // Handle enums/unions with object variants
+            else if let Some(variants) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(|v| v.as_array())
+            {
+                for variant in variants {
+                    if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
+                        let matches = map.keys().all(|k| props.contains_key(k));
+                        if matches {
+                            for (k, v) in map {
+                                if let Some(sub_schema) = props.get(k) {
+                                    recover_internally_tagged_enums(v, sub_schema);
+                                }
+                            }
+                            return;
+                        }
                     }
                 }
             }
