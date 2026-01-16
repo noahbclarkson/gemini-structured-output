@@ -1,6 +1,5 @@
 use gemini_structured_output::schema::GeminiStructured;
-use schemars::{generate::{SchemaGenerator, SchemaSettings}, JsonSchema};
-use serde_json::json;
+use schemars::generate::{SchemaGenerator, SchemaSettings};
 use xero_forecasting::config::FullForecastConfig;
 
 #[test]

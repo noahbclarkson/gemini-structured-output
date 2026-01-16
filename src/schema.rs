@@ -1240,6 +1240,21 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
             // Try to match array length to variant field count
             for variant in &enum_info.variants {
                 if variant.all_fields.len() == arr.len() {
+                    if variant.all_fields.len() == 1 {
+                        let field_name = &variant.all_fields[0];
+                        let field_is_array = variant
+                            .schema
+                            .get("properties")
+                            .and_then(|p| p.get(field_name))
+                            .and_then(|s| s.get("type"))
+                            .and_then(|t| t.as_str())
+                            == Some("array");
+
+                        if field_is_array && arr.len() > 1 {
+                            continue;
+                        }
+                    }
+
                     let mut variant_data = serde_json::Map::new();
                     for (field_name, field_value) in variant.all_fields.iter().zip(arr.iter()) {
                         variant_data.insert(field_name.clone(), field_value.clone());
@@ -1250,6 +1265,40 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
                     *value = Value::Object(variant_map);
 
                     return Ok(());
+                }
+            }
+
+            // Single field array wrapper
+            for variant in &enum_info.variants {
+                if variant.all_fields.len() == 1 {
+                    let field_name = &variant.all_fields[0];
+                    let field_schema = variant
+                        .schema
+                        .get("properties")
+                        .and_then(|p| p.get(field_name));
+                    let field_is_array = field_schema
+                        .map(|s| {
+                            s.get("type").and_then(|t| t.as_str()) == Some("array")
+                                || s.get("type").is_none()
+                        })
+                        .unwrap_or(false);
+
+                    if field_is_array {
+                        tracing::debug!(
+                            variant = %variant.name,
+                            field = %field_name,
+                            array_len = arr.len(),
+                            "wrapping flat array into single-field variant"
+                        );
+
+                        let mut variant_data = serde_json::Map::new();
+                        variant_data.insert(field_name.clone(), Value::Array(arr.clone()));
+
+                        let mut variant_map = serde_json::Map::new();
+                        variant_map.insert(variant.name.clone(), Value::Object(variant_data));
+                        *value = Value::Object(variant_map);
+                        return Ok(());
+                    }
                 }
             }
 
@@ -1940,6 +1989,7 @@ fn to_standard_json_schema(mut schema: Value) -> Value {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use schemars::JsonSchema;

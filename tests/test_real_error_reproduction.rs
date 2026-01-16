@@ -1,4 +1,6 @@
-use gemini_structured_output::schema::{normalize_json_response, prune_null_fields, unflatten_externally_tagged_enums, GeminiStructured};
+use gemini_structured_output::schema::{
+    prune_null_fields, unflatten_externally_tagged_enums, GeminiStructured,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
