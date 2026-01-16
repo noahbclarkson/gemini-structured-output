@@ -5,7 +5,6 @@ use std::env;
 use xero_forecasting::config::{FullForecastConfig, PnlProcessor, ForecastModel};
 
 #[tokio::test]
-#[ignore]
 async fn test_real_xero_forecast_config_with_gemini() {
     tracing_subscriber::fmt()
         .with_env_filter("debug")
@@ -15,7 +14,7 @@ async fn test_real_xero_forecast_config_with_gemini() {
     let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
 
     let client = StructuredClientBuilder::new(api_key)
-        .with_model(Model::Gemini25Flash)
+        .with_model(Model::Gemini3Flash)
         .with_default_retries(0)
         .with_default_parse_attempts(1)
         .build()

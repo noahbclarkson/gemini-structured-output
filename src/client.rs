@@ -677,7 +677,6 @@ impl StructuredClient {
             if is_gemini_3 {
                 // Gemini 3: enable strict JSON outputs alongside tools.
                 debug!("Gemini 3 detected: enforcing JSON schema with tools enabled");
-                info!("Applying response schema via generation config (tools enabled):\n{schema_json}");
                 config.response_schema = Some(gemini_schema);
                 config
                     .response_mime_type
@@ -700,7 +699,6 @@ impl StructuredClient {
                 });
             }
         } else {
-            info!("Applying response schema via generation config (no tools):\n{schema_json}");
             config.response_schema = Some(gemini_schema);
             config
                 .response_mime_type

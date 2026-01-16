@@ -765,12 +765,16 @@ fn extract_enum_info(schema: &Value) -> Option<EnumInfo> {
     let any_of = schema
         .get("x-anyOf-original")
         .or_else(|| schema.get("anyOf"))
+        .or_else(|| schema.get("oneOf"))
         ?.as_array()?;
 
     // Check if this is an Option<Enum> wrapper - if any variant itself has anyOf/x-anyOf-original,
     // we should unwrap and use those inner variants instead
     for variant_schema in any_of {
-        if variant_schema.get("anyOf").is_some() || variant_schema.get("x-anyOf-original").is_some() {
+        if variant_schema.get("anyOf").is_some()
+            || variant_schema.get("oneOf").is_some()
+            || variant_schema.get("x-anyOf-original").is_some()
+        {
             // This variant is itself an enum - unwrap and use it directly
             return extract_enum_info(variant_schema);
         }
@@ -828,6 +832,22 @@ fn extract_variant_info(schema: &Value) -> Option<VariantInfo> {
     if props.len() == 1 {
         let (variant_name, variant_schema) = props.iter().next()?;
 
+        let is_nested_enum = variant_schema.get("x-anyOf-original").is_some()
+            || variant_schema.get("anyOf").is_some()
+            || variant_schema.get("oneOf").is_some();
+
+        if is_nested_enum {
+            // Newtype variant wrapping another enum (e.g., Model(ForecastModel))
+            return Some(VariantInfo {
+                name: variant_name.clone(),
+                identifying_fields: vec![variant_name.clone()],
+                all_fields: vec![variant_name.clone()],
+                is_unit: false,
+                is_newtype: true,
+                schema: variant_schema.clone(),
+            });
+        }
+
         // Check if this variant has fields
         if let Some(variant_props) = variant_schema.get("properties").and_then(|v| v.as_object()) {
             let all_fields: Vec<String> = variant_props.keys().cloned().collect();
@@ -849,7 +869,7 @@ fn extract_variant_info(schema: &Value) -> Option<VariantInfo> {
                 is_newtype: false,
                 schema: variant_schema.clone(),
             });
-        } else if variant_schema.get("anyOf").is_some() {
+        } else if variant_schema.get("anyOf").is_some() || variant_schema.get("oneOf").is_some() {
             // Newtype variant wrapping another enum (e.g., Model(ForecastModel))
             // This is a single-field variant where the field value is itself an enum
             return Some(VariantInfo {
@@ -1038,6 +1058,12 @@ fn unflatten_variant_data(variant_data: &mut serde_json::Map<String, Value>, var
             if let Some(nested_enum_info) = extract_enum_info(field_schema) {
                 let _ = unflatten_enum_field(field_value, &nested_enum_info);
             }
+
+            if !value_matches_schema_shape(field_value, field_schema) {
+                if let Some(coerced) = coerce_value_to_schema(field_value, field_schema) {
+                    *field_value = coerced;
+                }
+            }
         }
     }
 }
@@ -1085,14 +1111,45 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
 
             if let Some(single_field_key) = single_field_key {
                 if map.len() == 1 {
-                    if let Some(mut inner_value) = map.remove(&single_field_key) {
+                    if let Some((removed_key, mut inner_value)) =
+                        remove_case_insensitive(map, &single_field_key)
+                    {
                         if matched_variant.is_newtype {
                             if let Some(nested_enum_info) = extract_enum_info(&matched_variant.schema) {
                                 let _ = unflatten_enum_field(&mut inner_value, &nested_enum_info);
                             }
 
+                            if !value_matches_schema_shape(&inner_value, &matched_variant.schema) {
+                                if let Some(coerced) =
+                                    coerce_value_to_schema(&inner_value, &matched_variant.schema)
+                                {
+                                    tracing::trace!(
+                                        variant = %matched_variant.name,
+                                        "Coerced newtype enum payload to schema defaults"
+                                    );
+                                    inner_value = coerced;
+                                }
+                            }
+
                             let mut variant_map = serde_json::Map::new();
                             variant_map.insert(matched_variant.name.clone(), inner_value);
+                            *value = Value::Object(variant_map);
+                            return Ok(());
+                        }
+
+                        if matched_variant.all_fields.len() == 1
+                            && !matches!(inner_value, Value::Object(_))
+                        {
+                            let field_name = &matched_variant.all_fields[0];
+                            let mut variant_data = serde_json::Map::new();
+                            variant_data.insert(field_name.clone(), inner_value);
+                            unflatten_variant_data(&mut variant_data, &matched_variant);
+
+                            let mut variant_map = serde_json::Map::new();
+                            variant_map.insert(
+                                matched_variant.name.clone(),
+                                Value::Object(variant_data),
+                            );
                             *value = Value::Object(variant_map);
                             return Ok(());
                         }
@@ -1111,7 +1168,7 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
                             return Ok(());
                         }
 
-                        map.insert(single_field_key, inner_value);
+                        map.insert(removed_key, inner_value);
                     }
                 }
             }
@@ -1130,7 +1187,10 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
 
                 // For newtype variants wrapping an enum, the schema itself is the enum schema
                 // (it has anyOf directly, not inside properties)
-                let field_schema = if matched_variant.is_newtype && matched_variant.schema.get("anyOf").is_some() {
+                let field_schema = if matched_variant.is_newtype
+                    && (matched_variant.schema.get("anyOf").is_some()
+                        || matched_variant.schema.get("oneOf").is_some())
+                {
                     Some(&matched_variant.schema)
                 } else {
                     matched_variant.schema
@@ -1152,7 +1212,9 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
                         // a discriminator for the inner enum, PLUS fields from the inner enum's variant
 
                         // Strategy: Remove the outer field, treat remaining fields as the nested enum
-                        let discriminator_value = map.get(field_name).and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let discriminator_value = get_case_insensitive_value(map, field_name)
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
 
                         tracing::trace!(
                             discriminator_field = %field_name,
@@ -1162,7 +1224,7 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
                         );
 
                         // Remove the discriminator field from map and collect remaining fields
-                        map.remove(field_name);
+                        let removed_field = remove_case_insensitive(map, field_name);
 
                         tracing::trace!(
                             remaining_fields = ?map.keys().collect::<Vec<_>>(),
@@ -1170,7 +1232,14 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
                         );
 
                         // The remaining fields should form the nested enum
-                        let mut nested_value = Value::Object(map.clone());
+                        let mut nested_value = if map.is_empty() {
+                            discriminator_value
+                                .clone()
+                                .map(Value::String)
+                                .unwrap_or_else(|| Value::Object(map.clone()))
+                        } else {
+                            Value::Object(map.clone())
+                        };
 
                         // Recursively unflatten the nested enum
                         if unflatten_enum_field(&mut nested_value, &nested_enum_info).is_ok() {
@@ -1187,8 +1256,10 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
                             return Ok(());
                         } else {
                             // Restore the discriminator field if unflatten failed
-                            if let Some(disc_val) = discriminator_value {
-                                map.insert(field_name.clone(), Value::String(disc_val));
+                            if let Some((orig_key, _)) = removed_field {
+                                if let Some(disc_val) = discriminator_value {
+                                    map.insert(orig_key, Value::String(disc_val));
+                                }
                             }
                         }
                     }
@@ -1222,14 +1293,9 @@ fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result:
             Ok(())
         }
         Value::String(s) => {
-            // Already a unit variant string - might need case conversion
-            // Check if this matches any variant name (case-insensitive)
-            for variant in &enum_info.variants {
-                if variant.is_unit && s.eq_ignore_ascii_case(&variant.name) {
-                    // Update to correct case
-                    *s = variant.name.clone();
-                    return Ok(());
-                }
+            if let Some(converted) = external_enum_value_from_string(s, enum_info) {
+                *value = converted;
+                return Ok(());
             }
             Ok(())
         }
@@ -1324,6 +1390,58 @@ fn is_variant_discriminator_match(value: &str, variant_name: &str) -> bool {
     normalize(value) == normalize(variant_name)
 }
 
+fn get_case_insensitive_value<'a>(
+    map: &'a Map<String, Value>,
+    key: &str,
+) -> Option<&'a Value> {
+    map.iter()
+        .find(|(k, _)| is_variant_discriminator_match(k, key))
+        .map(|(_, v)| v)
+}
+
+fn remove_case_insensitive(
+    map: &mut Map<String, Value>,
+    key: &str,
+) -> Option<(String, Value)> {
+    let match_key = map
+        .keys()
+        .find(|k| is_variant_discriminator_match(k, key))
+        .cloned();
+
+    match_key.and_then(|k| map.remove(&k).map(|v| (k, v)))
+}
+
+fn default_object_for_schema(schema: &Value) -> Option<Value> {
+    let any_of = schema
+        .get("x-anyOf-original")
+        .or_else(|| schema.get("anyOf"))
+        .or_else(|| schema.get("oneOf"))
+        .and_then(|v| v.as_array());
+
+    if let Some(variants) = any_of {
+        for variant in variants {
+            if let Some(obj) = default_object_for_schema(variant) {
+                return Some(obj);
+            }
+        }
+        return None;
+    }
+
+    let props = schema.get("properties").and_then(|v| v.as_object())?;
+    let required = schema.get("required").and_then(|v| v.as_array());
+    let mut map = Map::new();
+
+    if let Some(required) = required {
+        for field in required.iter().filter_map(|v| v.as_str()) {
+            if let Some(field_schema) = props.get(field) {
+                map.insert(field.to_string(), default_value_for_schema(field_schema));
+            }
+        }
+    }
+
+    Some(Value::Object(map))
+}
+
 fn default_value_for_schema(schema: &Value) -> Value {
     if let Some(default) = schema.get("default") {
         return default.clone();
@@ -1340,13 +1458,18 @@ fn default_value_for_schema(schema: &Value) -> Value {
     }
 
     if let Some(any_of) = schema
-        .get("anyOf")
+        .get("x-anyOf-original")
+        .or_else(|| schema.get("anyOf"))
         .or_else(|| schema.get("oneOf"))
         .and_then(|v| v.as_array())
     {
         if let Some(first) = any_of.first() {
             return default_value_for_schema(first);
         }
+    }
+
+    if let Some(obj) = default_object_for_schema(schema) {
+        return obj;
     }
 
     match schema.get("type").and_then(|v| v.as_str()) {
@@ -1358,6 +1481,60 @@ fn default_value_for_schema(schema: &Value) -> Value {
         Some("null") => Value::Null,
         _ => Value::Null,
     }
+}
+
+fn coerce_value_to_schema(value: &Value, schema: &Value) -> Option<Value> {
+    if value_matches_schema_shape(value, schema) {
+        return Some(value.clone());
+    }
+
+    if let (Value::String(s), Some(type_name)) =
+        (value, schema.get("type").and_then(|v| v.as_str()))
+    {
+        match type_name {
+            "number" => {
+                if let Ok(parsed) = s.parse::<f64>() {
+                    return Some(Value::Number(serde_json::Number::from_f64(parsed)?));
+                }
+            }
+            "integer" => {
+                if let Ok(parsed) = s.parse::<i64>() {
+                    return Some(Value::Number(parsed.into()));
+                }
+            }
+            "boolean" => {
+                let normalized = s.trim().to_ascii_lowercase();
+                if normalized == "true" {
+                    return Some(Value::Bool(true));
+                }
+                if normalized == "false" {
+                    return Some(Value::Bool(false));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(enum_info) = extract_enum_info(schema) {
+        if enum_info.is_externally_tagged {
+            match value {
+                Value::String(s) => {
+                    if let Some(converted) = external_enum_value_from_string(s, &enum_info) {
+                        return Some(converted);
+                    }
+                }
+                Value::Object(map) => {
+                    if let Some(converted) = external_enum_value_from_tagged_object(map, &enum_info)
+                    {
+                        return Some(converted);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Some(default_value_for_schema(schema))
 }
 
 fn map_has_field(map: &Map<String, Value>, field: &str) -> bool {
@@ -1570,10 +1747,20 @@ fn identify_variant_from_fields(
                 let has_same_name_field = variant.all_fields.iter()
                     .any(|f| is_variant_discriminator_match(f, field_name));
 
-                if (!has_same_name_field || variant.is_newtype)
+                let value_matches = map.get(field_name)
+                    .map(|value| value_contains_variant_data(value, variant))
+                    .unwrap_or(false);
+
+                let allow_single_field_collapse = variant.all_fields.len() == 1
                     && map.get(field_name)
-                        .map(|value| value_contains_variant_data(value, variant))
-                        .unwrap_or(false)
+                        .map(|value| !matches!(value, Value::Object(_)))
+                        .unwrap_or(false);
+
+                if (!has_same_name_field || variant.is_newtype || variant.is_unit)
+                    && (value_matches
+                        || variant.is_newtype
+                        || variant.is_unit
+                        || allow_single_field_collapse)
                 {
                     tracing::trace!(
                         field_name = %field_name,
