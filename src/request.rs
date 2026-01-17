@@ -276,6 +276,7 @@ where
         let mut parse_attempts = 0usize;
         let mut total_network_attempts = 0usize;
         let mut escalated = false;
+        let mut force_prompt_schema = false;
 
         loop {
             // Retry loop for 503/429 errors
@@ -315,6 +316,7 @@ where
                             cache_settings: &self.cache_settings,
                             system_instruction: &self.system_instruction,
                             safety_settings: &self.safety_settings,
+                            force_prompt_schema,
                         },
                     )
                     .await;
@@ -332,25 +334,47 @@ where
                         response = Some(res);
                         break;
                     }
-                    Err(e @ gemini_rust::ClientError::BadResponse { code, .. })
-                        if code == 503 || code == 429 =>
-                    {
-                        let structured_err = StructuredError::Gemini(e);
-                        // Use API-provided retry delay if available, otherwise exponential backoff
-                        let delay_secs = structured_err
-                            .retry_delay()
-                            .unwrap_or_else(|| 2u64.pow(attempt as u32));
-                        warn!(
-                            "Attempt {}/{} failed with status {}. Retrying in {}s...",
-                            attempt + 1,
-                            self.retry_count + 1,
-                            code,
-                            delay_secs
-                        );
-                        last_error = Some(structured_err);
-                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                    }
                     Err(e) => {
+                        let mut status_code = None;
+                        let mut depth_error = false;
+                        let mut retryable_status = false;
+
+                        if let gemini_rust::ClientError::BadResponse { code, description } = &e {
+                            status_code = Some(*code);
+                            depth_error =
+                                *code == 400 && is_schema_depth_error(description.as_deref());
+                            retryable_status = *code == 503 || *code == 429;
+                        }
+
+                        if depth_error && !force_prompt_schema {
+                            let structured_err = StructuredError::Gemini(e);
+                            warn!(
+                                error = %structured_err,
+                                "Schema depth rejected by API; retrying with prompt-embedded schema"
+                            );
+                            force_prompt_schema = true;
+                            last_error = Some(structured_err);
+                            continue;
+                        }
+
+                        if retryable_status {
+                            let structured_err = StructuredError::Gemini(e);
+                            // Use API-provided retry delay if available, otherwise exponential backoff
+                            let delay_secs = structured_err
+                                .retry_delay()
+                                .unwrap_or_else(|| 2u64.pow(attempt as u32));
+                            warn!(
+                                "Attempt {}/{} failed with status {}. Retrying in {}s...",
+                                attempt + 1,
+                                self.retry_count + 1,
+                                status_code.unwrap_or_default(),
+                                delay_secs
+                            );
+                            last_error = Some(structured_err);
+                            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                            continue;
+                        }
+
                         last_error = Some(StructuredError::Gemini(e));
                         break;
                     }
@@ -399,14 +423,11 @@ where
                     Ok(mut json_value) => {
                         let schema = T::gemini_schema();
 
-                        // Apply normalization for HashMap schemas that were transformed to arrays
-                        crate::schema::normalize_json_response(&mut json_value);
-
-                        // Prune null fields to handle Gemini's flattened enum variants
+                        // Prune null fields to handle Gemini's occasional nulls for optional fields
                         crate::schema::prune_null_fields(&mut json_value);
 
-                        // Unflatten externally-tagged enums that Gemini collapsed
-                        crate::schema::unflatten_externally_tagged_enums(&mut json_value, &schema);
+                        // Coerce enum strings when the model returns close-but-invalid values.
+                        crate::schema::coerce_enum_strings(&mut json_value, &schema);
 
                         // Recover internally-tagged enums that Gemini collapsed to strings
                         crate::schema::recover_internally_tagged_enums(&mut json_value, &schema);
@@ -569,6 +590,7 @@ where
                     cache_settings: &self.cache_settings,
                     system_instruction: &self.system_instruction,
                     safety_settings: &self.safety_settings,
+                    force_prompt_schema: false,
                 },
             )
             .await?;
@@ -634,13 +656,11 @@ where
                     .map_err(|e| StructuredError::parse_error(e, &cleaned))?;
                 let schema = T::gemini_schema();
 
-                crate::schema::normalize_json_response(&mut json_value);
-
-                // Prune null fields to handle Gemini's flattened enum variants
+                // Prune null fields to handle Gemini's occasional nulls for optional fields
                 crate::schema::prune_null_fields(&mut json_value);
 
-                // Unflatten externally-tagged enums that Gemini collapsed
-                crate::schema::unflatten_externally_tagged_enums(&mut json_value, &schema);
+                // Coerce enum strings when the model returns close-but-invalid values.
+                crate::schema::coerce_enum_strings(&mut json_value, &schema);
 
                 // Recover internally-tagged enums that Gemini collapsed to strings
                 crate::schema::recover_internally_tagged_enums(&mut json_value, &schema);
@@ -715,4 +735,10 @@ pub(crate) fn clean_json_text(text: &str) -> String {
     }
     // Return as is if no heuristics matched
     text.to_string()
+}
+
+fn is_schema_depth_error(description: Option<&str>) -> bool {
+    description
+        .map(|desc| desc.contains("maximum allowed nesting depth"))
+        .unwrap_or(false)
 }

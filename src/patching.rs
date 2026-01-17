@@ -15,7 +15,10 @@ use crate::{
     files::FileManager,
     generator::TextGenerator,
     models::{RefinementAttempt, RefinementOutcome},
-    schema::{compile_validator, GeminiStructured, StructuredValidator},
+    schema::{
+        clean_schema_for_gemini, compile_validator, strip_x_fields, warn_if_schema_too_deep,
+        GeminiStructured, StructuredValidator,
+    },
     StructuredClient,
 };
 
@@ -341,7 +344,10 @@ impl RefinementEngine {
         let use_generator = self.uses_generators();
 
         let system_prompt = self.build_system_prompt();
-        let patch_schema = PatchResult::gemini_schema();
+        let mut patch_schema = PatchResult::gemini_schema();
+        clean_schema_for_gemini(&mut patch_schema);
+        strip_x_fields(&mut patch_schema);
+        warn_if_schema_too_deep(&patch_schema, crate::schema::STRICT_SCHEMA_DEPTH_LIMIT);
 
         debug!(
             "Starting refinement loop with {:?}",
@@ -380,7 +386,8 @@ impl RefinementEngine {
                         &prompt,
                         GenerationConfig {
                             response_mime_type: Some("application/json".to_string()),
-                            response_schema: Some(patch_schema.clone()),
+                            response_json_schema: Some(patch_schema.clone()),
+                            response_schema: None,
                             temperature: Some(self.config.temperature),
                             ..Default::default()
                         },
@@ -400,7 +407,8 @@ impl RefinementEngine {
                             .with_system_instruction(&system_prompt)
                             .with_generation_config(GenerationConfig {
                                 response_mime_type: Some("application/json".to_string()),
-                                response_schema: Some(patch_schema.clone()),
+                                response_json_schema: Some(patch_schema.clone()),
+                                response_schema: None,
                                 temperature: Some(self.config.temperature),
                                 ..Default::default()
                             });

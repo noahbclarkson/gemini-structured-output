@@ -1,31 +1,24 @@
-use std::collections::HashSet;
-
 use schemars::{
     generate::{SchemaGenerator, SchemaSettings},
     JsonSchema,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{Result, StructuredError};
 
 /// Trait implemented by any type that can be used as a structured Gemini response.
 pub trait GeminiStructured: JsonSchema {
-    /// Produce a Gemini-compatible OpenAPI 3 schema.
+    /// Produce a Gemini-compatible JSON Schema.
     fn gemini_schema() -> Value {
-        let settings = SchemaSettings::openapi3().with(|s| {
-            // Inline subschemas to keep strict-mode compatibility.
-            s.inline_subschemas = true;
+        let settings = SchemaSettings::draft2020_12().with(|s| {
             s.meta_schema = None;
         });
 
         let generator = SchemaGenerator::new(settings);
         let schema = generator.into_root_schema_for::<Self>();
-        let mut value = serde_json::to_value(&schema).unwrap();
-
-        clean_schema_for_gemini(&mut value);
-        value
+        serde_json::to_value(&schema).unwrap()
     }
 
     /// Stable hash for caching schemas and prompts.
@@ -84,17 +77,50 @@ pub trait GeminiValidator {
     fn gemini_validate(&self) -> Option<String>;
 }
 
-/// Recursively strip or normalize fields that Gemini strict schema mode does not support.
+/// Recursively strip fields that Gemini strict schema mode does not support.
 pub fn clean_schema_for_gemini(value: &mut Value) {
-    let snapshot = value.clone();
-    let mut stack = Vec::new();
+    match value {
+        Value::Object(map) => {
+            let unsupported = [
+                "$schema",
+                "default",
+                "examples",
+                "example",
+                "title",
+                "readOnly",
+                "writeOnly",
+                "deprecated",
+                "pattern",
+                "minLength",
+                "maxLength",
+                "minProperties",
+                "maxProperties",
+                "if",
+                "then",
+                "else",
+                "not",
+                "const",
+            ];
 
-    inline_refs(value, &snapshot, &mut stack);
-    clean_schema_node(value);
+            for key in unsupported {
+                map.remove(key);
+            }
+
+            for v in map.values_mut() {
+                clean_schema_for_gemini(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                clean_schema_for_gemini(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Strip x-* custom fields from a schema before sending to Gemini.
-/// These fields are used internally for unflattening but Gemini doesn't accept them.
+/// These fields are used internally but Gemini doesn't accept them.
 pub fn strip_x_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -115,601 +141,42 @@ pub fn strip_x_fields(value: &mut Value) {
     }
 }
 
-fn inline_refs(value: &mut Value, root: &Value, stack: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(reference)) = map.get("$ref") {
-                let reference = reference.clone();
-                if stack.contains(&reference) {
-                    *value = Value::Object(Map::new());
-                    return;
+/// Returns the max nesting depth of a schema.
+pub fn schema_depth(value: &Value) -> usize {
+    fn walk(value: &Value, depth: usize, max: &mut usize) {
+        *max = (*max).max(depth);
+        match value {
+            Value::Object(map) => {
+                for v in map.values() {
+                    walk(v, depth + 1, max);
                 }
-                if let Some(resolved) = resolve_pointer(root, &reference) {
-                    stack.push(reference);
-                    let mut resolved = resolved.clone();
-                    inline_refs(&mut resolved, root, stack);
-                    stack.pop();
-                    *value = resolved;
-                    return;
-                }
-                *value = Value::Object(Map::new());
-                return;
             }
+            Value::Array(arr) => {
+                for v in arr {
+                    walk(v, depth + 1, max);
+                }
+            }
+            _ => {}
+        }
+    }
 
-            for (_, v) in map.iter_mut() {
-                inline_refs(v, root, stack);
-            }
-        }
-        Value::Array(arr) => {
-            for v in arr {
-                inline_refs(v, root, stack);
-            }
-        }
-        _ => {}
+    let mut max = 0;
+    walk(value, 1, &mut max);
+    max
+}
+
+/// Emit a warning if a schema exceeds the suggested nesting depth.
+pub fn warn_if_schema_too_deep(schema: &Value, max_depth: usize) {
+    let depth = schema_depth(schema);
+    if depth >= max_depth {
+        warn!(schema.depth = depth, schema.depth.max = max_depth, "Schema nesting depth is high; Gemini strict mode may reject deeply nested schemas");
     }
 }
 
-fn resolve_pointer<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
-    let pointer = reference.strip_prefix('#').unwrap_or(reference);
-    root.pointer(pointer)
-}
-
-/// Determines the JSON Schema type from the schema node.
-fn get_schema_type(map: &Map<String, Value>) -> Option<&str> {
-    map.get("type").and_then(|v| v.as_str())
-}
-
-/// Common tag field names used for internally-tagged enums
-const TAG_FIELD_NAMES: &[&str] = &["type", "kind", "model", "variant", "tag"];
-
-/// Merges enum values from a new variant into an existing tag field
-fn merge_tag_field(existing: &mut Value, new_variant: &Value) {
-    // Extract enum values from both existing and new
-    let existing_enums = existing
-        .as_object()
-        .and_then(|obj| obj.get("enum"))
-        .and_then(|e| e.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let new_enums = new_variant
-        .as_object()
-        .and_then(|obj| obj.get("enum"))
-        .and_then(|e| e.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    // Merge enum values, avoiding duplicates
-    let mut merged: Vec<Value> = existing_enums;
-    for val in new_enums {
-        if !merged.contains(&val) {
-            merged.push(val);
-        }
-    }
-
-    // Update the existing field with merged enum
-    if let Some(obj) = existing.as_object_mut() {
-        if !merged.is_empty() {
-            obj.insert("enum".to_string(), json!(merged));
-        }
-        // Merge descriptions if both have them
-        if let (Some(existing_desc), Some(new_desc)) = (
-            obj.get("description").and_then(|d| d.as_str()),
-            new_variant
-                .as_object()
-                .and_then(|o| o.get("description"))
-                .and_then(|d| d.as_str()),
-        ) {
-            if existing_desc != new_desc && !existing_desc.contains(new_desc) {
-                obj.insert(
-                    "description".to_string(),
-                    json!(format!("{} | {}", existing_desc, new_desc)),
-                );
-            }
-        }
-    }
-}
-
-/// Merges multiple schema variants into a single permissive object schema.
-/// This allows Gemini to understand enum types by flattening all variant properties
-/// into a single schema with the tag field containing all possible values.
-fn flatten_variants(parent: &mut Map<String, Value>, variants: Vec<Value>) {
-    // Store the original anyOf structure so we can unflatten later
-    parent.insert("x-anyOf-original".to_string(), json!(variants));
-
-    // Force type to object
-    parent.insert("type".to_string(), json!("object"));
-
-    // Initialize or get the properties map
-    let parent_props = parent
-        .entry("properties".to_string())
-        .or_insert(json!({}))
-        .as_object_mut();
-
-    let Some(parent_props) = parent_props else {
-        return;
-    };
-
-    // Track required fields across variants for intersection
-    let mut common_required: Option<HashSet<String>> = None;
-
-    // Collect all descriptions from variants for the parent
-    let mut variant_descriptions: Vec<String> = Vec::new();
-
-    for variant in variants {
-        if let Value::Object(v_map) = variant {
-            // Collect variant description
-            if let Some(desc) = v_map.get("description").and_then(|d| d.as_str()) {
-                variant_descriptions.push(desc.to_string());
-            }
-
-            // Merge properties from this variant
-            if let Some(Value::Object(props)) = v_map.get("properties") {
-                for (k, v) in props {
-                    if !parent_props.contains_key(k) {
-                        parent_props.insert(k.clone(), v.clone());
-                    } else if TAG_FIELD_NAMES.contains(&k.as_str()) {
-                        // Merge enum values for tag fields
-                        merge_tag_field(parent_props.get_mut(k).unwrap(), v);
-                    }
-                }
-            }
-
-            // Intersect required fields (only keep fields required in ALL variants)
-            if let Some(Value::Array(req_arr)) = v_map.get("required") {
-                let variant_required: HashSet<String> = req_arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-
-                common_required = Some(match common_required.take() {
-                    Some(existing) => existing.intersection(&variant_required).cloned().collect(),
-                    None => variant_required,
-                });
-            }
-        }
-    }
-
-    // Set the intersected required fields
-    if let Some(required) = common_required {
-        if !required.is_empty() {
-            let required_vec: Vec<Value> = required.into_iter().map(Value::String).collect();
-            parent.insert("required".to_string(), json!(required_vec));
-        }
-    }
-
-    // Add combined description if we collected any
-    if !variant_descriptions.is_empty() && !parent.contains_key("description") {
-        parent.insert(
-            "description".to_string(),
-            json!(format!(
-                "One of the following variants: {}",
-                variant_descriptions.join(" | ")
-            )),
-        );
-    }
-
-    // Note: We don't need to clean properties here because variants are pre-cleaned
-    // before being passed to flatten_variants.
-}
-
-/// Clean a schema node based on Gemini's supported properties per type.
-///
-/// Gemini supports the following JSON Schema properties:
-/// - Common: type, title, description, nullable, enum
-/// - For objects: properties, required, additionalProperties
-/// - For strings: enum, format
-/// - For numbers/integers: enum, minimum, maximum
-/// - For arrays: items, prefixItems, minItems, maxItems
-///
-/// This function uses an iterative approach with an explicit stack to avoid
-/// call stack overflow when processing deeply nested schemas (e.g., recursive types).
-fn clean_schema_node(root: &mut Value) {
-    // Iterative cleaning using explicit stack.
-    // We may need multiple passes because:
-    // 1. oneOf/anyOf variants may have allOf that needs merging first
-    // 2. After allOf is merged, we can properly detect variant types
-    const MAX_PASSES: usize = 100;
-
-    for _ in 0..MAX_PASSES {
-        let mut changed = false;
-        let mut stack: Vec<*mut Value> = vec![root as *mut Value];
-
-        while let Some(ptr) = stack.pop() {
-            // SAFETY: These pointers come from our owned data structure.
-            // We never create aliasing mutable references - each node is
-            // visited exactly once per pass.
-            let value = unsafe { &mut *ptr };
-
-            if let Value::Object(map) = value {
-                changed |= clean_object_node(map);
-
-                // Queue all children for processing (including anyOf/oneOf variants)
-                for v in map.values_mut() {
-                    stack.push(v as *mut Value);
-                }
-            } else if let Value::Array(arr) = value {
-                for v in arr.iter_mut() {
-                    stack.push(v as *mut Value);
-                }
-            }
-        }
-
-        if !changed {
-            break;
-        }
-    }
-}
-
-/// Process a single object node. Returns true if any changes were made.
-fn clean_object_node(map: &mut Map<String, Value>) -> bool {
-    let mut changed = false;
-
-    // Handle allOf by merging sub-schemas into the parent.
-    // This is crucial for handling schemars' pattern of using allOf to attach descriptions to refs.
-    if let Some(Value::Array(all_of)) = map.remove("allOf") {
-        changed = true;
-        for sub_schema in all_of {
-            if let Value::Object(sub_map) = sub_schema {
-                for (k, v) in sub_map {
-                    match k.as_str() {
-                        "properties" => {
-                            // Merge properties: add child properties to parent
-                            let parent_props = map
-                                .entry("properties")
-                                .or_insert(json!({}))
-                                .as_object_mut()
-                                .unwrap();
-                            if let Value::Object(child_props) = v {
-                                for (pk, pv) in child_props {
-                                    parent_props.insert(pk, pv);
-                                }
-                            }
-                        }
-                        "required" => {
-                            // Merge required arrays, avoiding duplicates
-                            if let Value::Array(child_req) = v {
-                                let parent_req = map
-                                    .entry("required")
-                                    .or_insert(json!([]))
-                                    .as_array_mut()
-                                    .unwrap();
-                                for r in child_req {
-                                    if !parent_req.contains(&r) {
-                                        parent_req.push(r);
-                                    }
-                                }
-                            }
-                        }
-                        // For other keys (type, enum, items, etc.), adopt them if missing in parent
-                        _ => {
-                            if !map.contains_key(&k) {
-                                map.insert(k, v);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Normalize array types to single types with nullable flag.
-    // Gemini API requires type: "string", not type: ["string", "null"].
-    if let Some(Value::Array(types)) = map.get("type").cloned() {
-        let type_strs: Vec<String> = types
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-
-        let has_null = type_strs.iter().any(|t| t == "null");
-        let real_types: Vec<String> = type_strs.into_iter().filter(|t| t != "null").collect();
-
-        if real_types.len() == 1 {
-            changed = true;
-            map.insert("type".to_string(), json!(real_types[0]));
-            if has_null {
-                map.insert("nullable".to_string(), json!(true));
-            }
-        } else if real_types.is_empty() && has_null {
-            changed = true;
-            map.remove("type");
-            map.insert("nullable".to_string(), json!(true));
-        } else if !real_types.is_empty() {
-            changed = true;
-            let variants: Vec<Value> = real_types
-                .into_iter()
-                .map(|t| json!({ "type": t }))
-                .collect();
-            map.remove("type");
-            map.insert("anyOf".to_string(), Value::Array(variants));
-            if has_null {
-                map.insert("nullable".to_string(), json!(true));
-            }
-        }
-    }
-
-    // Properties that are never supported by Gemini
-    let always_unsupported = [
-        "$schema",
-        "$ref",
-        "components",
-        "definitions",
-        "$defs",
-        "default",
-        "examples",
-        "not",
-        "if",
-        "then",
-        "else",
-    ];
-
-    for key in always_unsupported {
-        if map.remove(key).is_some() {
-            changed = true;
-        }
-    }
-
-    // Handle oneOf/anyOf intelligently based on variant types
-    if let Some(Value::Array(variants)) = map.remove("oneOf").or_else(|| map.remove("anyOf")) {
-        changed = true;
-
-        // Check if any variant still has allOf (needs another pass to process)
-        let variants_need_processing = variants
-            .iter()
-            .any(|v| v.get("allOf").is_some());
-
-        if variants_need_processing {
-            // Put it back as anyOf - it will be processed in the next pass
-            // after the variants' allOf are merged
-            map.insert("anyOf".to_string(), Value::Array(variants));
-        } else {
-            // Check if this is a simple string enum
-            let is_pure_string_enum = variants.iter().all(|v| {
-                let is_string = v.get("type").and_then(|t| t.as_str()) == Some("string");
-                let has_const_string = v.get("const").and_then(|c| c.as_str()).is_some();
-                let has_enum = v.get("enum").is_some();
-                (is_string || has_const_string || has_enum)
-                    && (v.get("const").is_some() || has_enum)
-            });
-
-            if is_pure_string_enum {
-                // CASE 1: Pure String Enum - convert to { "type": "string", "enum": [...] }
-                let mut enum_values = Vec::new();
-                for v in &variants {
-                    if let Some(c) = v.get("const") {
-                        enum_values.push(c.clone());
-                    } else if let Some(Value::Array(enums)) = v.get("enum") {
-                        enum_values.extend(enums.clone());
-                    }
-                }
-                enum_values.sort_by_key(|a| a.to_string());
-                enum_values.dedup();
-
-                map.insert("type".to_string(), json!("string"));
-                map.insert("enum".to_string(), Value::Array(enum_values));
-            } else {
-                // Check for mixed types (Strings AND Objects)
-                let has_objects = variants.iter().any(|v| {
-                    v.get("type").and_then(|t| t.as_str()) == Some("object")
-                        || v.get("properties").is_some()
-                });
-                let has_strings = variants.iter().any(|v| {
-                    v.get("type").and_then(|t| t.as_str()) == Some("string")
-                        || v.get("enum").is_some()
-                });
-
-                if has_objects && has_strings {
-                    // CASE 2: Mixed Enum - preserve as anyOf
-                    map.insert("anyOf".to_string(), Value::Array(variants));
-                    map.remove("type");
-                    map.remove("properties");
-                    map.remove("required");
-                    map.remove("enum");
-                } else {
-                    // CASE 3: Complex Object Union - flatten
-                    flatten_variants(map, variants);
-                }
-            }
-        }
-    }
-
-    // Remove const at the top level
-    if map.remove("const").is_some() {
-        changed = true;
-    }
-
-    // Get the type to determine which properties to keep
-    let schema_type = get_schema_type(map).map(|s| s.to_string());
-
-    // Properties only valid for specific types
-    match schema_type.as_deref() {
-        Some("object") => {
-            map.remove("pattern");
-            map.remove("minLength");
-            map.remove("maxLength");
-            map.remove("format");
-            map.remove("items");
-            map.remove("prefixItems");
-            map.remove("minItems");
-            map.remove("maxItems");
-            map.remove("minimum");
-            map.remove("maximum");
-            map.remove("minProperties");
-            map.remove("maxProperties");
-        }
-        Some("array") => {
-            map.remove("properties");
-            map.remove("required");
-            map.remove("additionalProperties");
-            map.remove("pattern");
-            map.remove("minLength");
-            map.remove("maxLength");
-            map.remove("format");
-            map.remove("minimum");
-            map.remove("maximum");
-            map.remove("minProperties");
-            map.remove("maxProperties");
-        }
-        Some("string") => {
-            map.remove("properties");
-            map.remove("required");
-            map.remove("additionalProperties");
-            map.remove("items");
-            map.remove("prefixItems");
-            map.remove("minItems");
-            map.remove("maxItems");
-            map.remove("minimum");
-            map.remove("maximum");
-            map.remove("pattern");
-            map.remove("minLength");
-            map.remove("maxLength");
-            map.remove("minProperties");
-            map.remove("maxProperties");
-        }
-        Some("number") | Some("integer") => {
-            map.remove("properties");
-            map.remove("required");
-            map.remove("additionalProperties");
-            map.remove("items");
-            map.remove("prefixItems");
-            map.remove("minItems");
-            map.remove("maxItems");
-            map.remove("pattern");
-            map.remove("minLength");
-            map.remove("maxLength");
-            map.remove("format");
-            map.remove("minProperties");
-            map.remove("maxProperties");
-        }
-        Some("boolean") | Some("null") => {
-            map.remove("properties");
-            map.remove("required");
-            map.remove("additionalProperties");
-            map.remove("items");
-            map.remove("prefixItems");
-            map.remove("minItems");
-            map.remove("maxItems");
-            map.remove("pattern");
-            map.remove("minLength");
-            map.remove("maxLength");
-            map.remove("format");
-            map.remove("minimum");
-            map.remove("maximum");
-            map.remove("minProperties");
-            map.remove("maxProperties");
-        }
-        _ => {
-            map.remove("additionalProperties");
-            map.remove("pattern");
-            map.remove("minLength");
-            map.remove("maxLength");
-            map.remove("minProperties");
-            map.remove("maxProperties");
-        }
-    }
-
-    // SPECIAL HANDLING FOR HASHMAPS (additionalProperties)
-    if let Some(add_props) = map.remove("additionalProperties") {
-        changed = true;
-        let has_specific_props = map
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .is_some_and(|o| !o.is_empty());
-
-        if !has_specific_props && add_props.is_object() {
-            // Store the original additionalProperties so we can use it later for unflattening
-            map.insert("x-additionalProperties-original".to_string(), add_props.clone());
-
-            map.insert("type".to_string(), json!("array"));
-            map.insert(
-                "items".to_string(),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "__key__": { "type": "string" },
-                        "__value__": add_props
-                    },
-                    "required": ["__key__", "__value__"]
-                }),
-            );
-            map.remove("required");
-            map.remove("properties");
-        }
-    }
-
-    // GENERAL CLEANUP FOR EMPTY OBJECTS
-    if get_schema_type(map) == Some("object") {
-        let has_properties = map
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .is_some_and(|p| !p.is_empty());
-
-        if !has_properties {
-            changed = true;
-            map.remove("type");
-            map.remove("required");
-            map.remove("properties");
-            map.remove("additionalProperties");
-        }
-    }
-
-    changed
-}
-
-/// Recursively normalizes the JSON response from Gemini.
-/// Converts Arrays of {__key__, __value__} back into Objects { key: value }.
-pub fn normalize_json_response(value: &mut Value) {
-    match value {
-        Value::Array(arr) => {
-            // Check if this array looks like a transformed Map
-            let is_kv_map = !arr.is_empty()
-                && arr.iter().all(|item| {
-                    item.as_object()
-                        .is_some_and(|o| o.contains_key("__key__") && o.contains_key("__value__"))
-                });
-
-            if is_kv_map {
-                let mut map = Map::new();
-                for item in arr.drain(..) {
-                    if let Value::Object(mut obj) = item {
-                        if let (Some(Value::String(key)), Some(mut val)) =
-                            (obj.remove("__key__"), obj.remove("__value__"))
-                        {
-                            // Recurse into value before inserting
-                            normalize_json_response(&mut val);
-                            map.insert(key, val);
-                        }
-                    }
-                }
-                *value = Value::Object(map);
-            } else {
-                // Normal array, recurse
-                for item in arr {
-                    normalize_json_response(item);
-                }
-            }
-        }
-        Value::Object(map) => {
-            for v in map.values_mut() {
-                normalize_json_response(v);
-            }
-        }
-        _ => {}
-    }
-}
+/// Conservative nesting depth threshold for Gemini strict schema mode.
+pub const STRICT_SCHEMA_DEPTH_LIMIT: usize = 12;
 
 /// Recursively remove object keys where the value is null.
-///
-/// This is necessary because Gemini Strict Mode often outputs `{"optional_field": null}`
-/// for flattened oneOf variants, which confuses Serde if the Rust type is not Option<T>.
-///
-/// When schemas use internally-tagged enums (e.g., `#[serde(tag = "type")]`), Gemini
-/// may generate responses like `{"model": null, "calculation": {...}}` instead of
-/// just `{"calculation": {...}}`. This causes serde deserialization to fail because
-/// the field inside the enum variant is not `Option<T>`.
-///
-/// By pruning null values before deserialization, we allow serde to correctly
-/// identify the active variant.
 pub fn prune_null_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -727,292 +194,88 @@ pub fn prune_null_fields(value: &mut Value) {
     }
 }
 
-/// Information about an enum variant extracted from the schema
-#[derive(Debug, Clone)]
-struct VariantInfo {
-    /// The variant name as it appears in the schema (e.g., "Mstl", "Auto")
-    name: String,
-    /// Field names that uniquely identify this variant
-    identifying_fields: Vec<String>,
-    /// All fields that belong to this variant
-    all_fields: Vec<String>,
-    /// Whether this is a unit variant (no fields)
-    is_unit: bool,
-    /// Whether this is a newtype variant (single unnamed field)
-    is_newtype: bool,
-    /// The schema for this variant's data
-    schema: Value,
+const TAG_FIELD_NAMES: &[&str] = &["type", "kind", "model", "variant", "tag"];
+
+/// Recursively attempts to recover internally tagged enums where the LLM
+/// output a string literal instead of the wrapper object.
+pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
+    recover_internally_tagged_enums_with_root(value, schema, schema);
 }
 
-/// Information about an enum extracted from the schema
-#[derive(Debug, Clone)]
-struct EnumInfo {
-    /// All variants of this enum
-    variants: Vec<VariantInfo>,
-    /// Whether this is an externally-tagged enum (default serde representation)
-    is_externally_tagged: bool,
-}
+fn recover_internally_tagged_enums_with_root(value: &mut Value, schema: &Value, root: &Value) {
+    let schema = deref_schema(schema, root);
 
-#[derive(Debug, Clone)]
-struct VariantMatch {
-    variant: VariantInfo,
-    single_field_key: Option<String>,
-}
-
-/// Extract enum information from an anyOf schema (or x-anyOf-original if the schema was flattened)
-fn extract_enum_info(schema: &Value) -> Option<EnumInfo> {
-    // Check for x-anyOf-original first (flattened enums) then fall back to anyOf
-    let any_of = schema
-        .get("x-anyOf-original")
-        .or_else(|| schema.get("anyOf"))
-        .or_else(|| schema.get("oneOf"))
-        ?.as_array()?;
-
-    // Check if this is an Option<Enum> wrapper - if any variant itself has anyOf/x-anyOf-original,
-    // we should unwrap and use those inner variants instead
-    for variant_schema in any_of {
-        if variant_schema.get("anyOf").is_some()
-            || variant_schema.get("oneOf").is_some()
-            || variant_schema.get("x-anyOf-original").is_some()
-        {
-            // This variant is itself an enum - unwrap and use it directly
-            return extract_enum_info(variant_schema);
-        }
-    }
-
-    let mut variants = Vec::new();
-
-    for variant_schema in any_of {
-        if let Some(variant) = extract_variant_info(variant_schema) {
-            variants.push(variant);
-        } else if let Some(string_val) = variant_schema.get("enum").and_then(|v| v.as_array()) {
-            // Handle unit variants represented as string enums
-            for unit_variant in string_val {
-                if let Some(name) = unit_variant.as_str() {
-                    variants.push(VariantInfo {
-                        name: name.to_string(),
-                        identifying_fields: vec![],
-                        all_fields: vec![],
-                        is_unit: true,
-                        is_newtype: false,
-                        schema: variant_schema.clone(),
-                    });
+    match value {
+        Value::Array(arr) => {
+            if let Some(items_schema) = schema.get("items") {
+                for item in arr {
+                    recover_internally_tagged_enums_with_root(item, items_schema, root);
+                }
+            } else if let Some(prefix_items) = schema.get("prefixItems").and_then(|v| v.as_array())
+            {
+                for (i, item) in arr.iter_mut().enumerate() {
+                    if let Some(sub_schema) = prefix_items.get(i) {
+                        recover_internally_tagged_enums_with_root(item, sub_schema, root);
+                    }
                 }
             }
         }
-    }
-
-    if variants.is_empty() {
-        return None;
-    }
-
-    // Detect if this is externally-tagged by checking if variants have single-key objects
-    // An externally-tagged enum has variants where each variant is represented as
-    // an object with a single key (the variant name)
-    let is_externally_tagged = variants.iter().any(|v| !v.is_unit);
-
-    tracing::trace!(
-        variants_count = variants.len(),
-        is_externally_tagged = is_externally_tagged,
-        "Extracted enum info"
-    );
-
-    Some(EnumInfo {
-        variants,
-        is_externally_tagged,
-    })
-}
-
-/// Extract information about a single variant from its schema
-fn extract_variant_info(schema: &Value) -> Option<VariantInfo> {
-    let props = schema.get("properties")?.as_object()?;
-
-    // For externally-tagged enums, there should be exactly one top-level property
-    // which is the variant name
-    if props.len() == 1 {
-        let (variant_name, variant_schema) = props.iter().next()?;
-
-        let is_nested_enum = variant_schema.get("x-anyOf-original").is_some()
-            || variant_schema.get("anyOf").is_some()
-            || variant_schema.get("oneOf").is_some();
-
-        if is_nested_enum {
-            // Newtype variant wrapping another enum (e.g., Model(ForecastModel))
-            return Some(VariantInfo {
-                name: variant_name.clone(),
-                identifying_fields: vec![variant_name.clone()],
-                all_fields: vec![variant_name.clone()],
-                is_unit: false,
-                is_newtype: true,
-                schema: variant_schema.clone(),
-            });
-        }
-
-        // Check if this variant has fields
-        if let Some(variant_props) = variant_schema.get("properties").and_then(|v| v.as_object()) {
-            let all_fields: Vec<String> = variant_props.keys().cloned().collect();
-            let variant_required = variant_schema.get("required")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| all_fields.clone());
-
-            return Some(VariantInfo {
-                name: variant_name.clone(),
-                identifying_fields: variant_required.clone(),
-                all_fields,
-                is_unit: false,
-                is_newtype: false,
-                schema: variant_schema.clone(),
-            });
-        } else if variant_schema.get("anyOf").is_some() || variant_schema.get("oneOf").is_some() {
-            // Newtype variant wrapping another enum (e.g., Model(ForecastModel))
-            // This is a single-field variant where the field value is itself an enum
-            return Some(VariantInfo {
-                name: variant_name.clone(),
-                identifying_fields: vec![variant_name.clone()],
-                all_fields: vec![variant_name.clone()],
-                is_unit: false,
-                is_newtype: true,
-                schema: variant_schema.clone(),
-            });
-        } else if variant_schema.get("type").and_then(|v| v.as_str()) == Some("string") {
-            // Unit variant represented as string or string enum
-            return Some(VariantInfo {
-                name: variant_name.clone(),
-                identifying_fields: vec![],
-                all_fields: vec![],
-                is_unit: true,
-                is_newtype: false,
-                schema: variant_schema.clone(),
-            });
-        } else {
-            // Other newtype variant (single unnamed field)
-            return Some(VariantInfo {
-                name: variant_name.clone(),
-                identifying_fields: vec![variant_name.clone()],
-                all_fields: vec![variant_name.clone()],
-                is_unit: false,
-                is_newtype: true,
-                schema: variant_schema.clone(),
-            });
-        }
-    }
-
-    None
-}
-
-/// Unflatten externally-tagged enums that Gemini has collapsed
-///
-/// Gemini Strict Mode often outputs flattened enum structures like:
-/// ```json
-/// {"model": "mstl", "seasonalPeriods": [12], "trendModel": "ets"}
-/// ```
-///
-/// But serde's externally-tagged enums expect:
-/// ```json
-/// {"model": {"Mstl": {"seasonalPeriods": [12], "trendModel": "Ets"}}}
-/// ```
-///
-/// This function detects these patterns and restructures them.
-pub fn unflatten_externally_tagged_enums(value: &mut Value, schema: &Value) {
-    // First check if the value itself is a flattened enum (schema has anyOf at root)
-    if let Some(enum_info) = extract_enum_info(schema) {
-        if let Err(e) = unflatten_enum_field(value, &enum_info) {
-            tracing::debug!(
-                error = %e,
-                "Failed to unflatten root enum value"
-            );
-        }
-        return;
-    }
-
-    // Special case: value is Object but schema is Array with x-additionalProperties-original
-    // This happens with HashMaps after normalize_json_response converts them from arrays back to objects
-    if let Value::Object(map) = value {
-        if schema.get("type").and_then(|t| t.as_str()) == Some("array") {
-            if let Some(original_additional_props) = schema.get("x-additionalProperties-original") {
-                tracing::trace!(
-                    keys_count = map.keys().len(),
-                    "Handling HashMap (normalized from array) - recursing into values with x-additionalProperties-original"
-                );
-                // This is a HashMap - recurse into each value with the original additionalProperties schema
-                let keys: Vec<String> = map.keys().cloned().collect();
-                for key in keys {
-                    if let Some(v) = map.get_mut(&key) {
-                        unflatten_externally_tagged_enums(v, original_additional_props);
+        Value::Object(map) => {
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                let additional = schema.get("additionalProperties");
+                for (k, v) in map.iter_mut() {
+                    if let Some(sub_schema) = props.get(k) {
+                        recover_internally_tagged_enums_with_root(v, sub_schema, root);
+                    } else if let Some(additional) = additional {
+                        recover_internally_tagged_enums_with_root(v, additional, root);
                     }
                 }
                 return;
             }
-        }
-    }
 
-    match value {
-        Value::Object(map) => {
-            // First, recursively process nested values
-            let keys: Vec<String> = map.keys().cloned().collect();
-            tracing::trace!(
-                keys_count = keys.len(),
-                keys = ?keys,
-                has_properties = schema.get("properties").is_some(),
-                has_additional_properties = schema.get("additionalProperties").is_some(),
-                "Processing object keys"
-            );
-            for key in &keys {
-                if let Some(v) = map.get_mut(key) {
-                    if let Some(prop_schema) = schema
-                        .get("properties")
-                        .and_then(|p| p.get(key))
-                    {
-                        tracing::trace!(key = %key, "Found key in schema properties, recursing");
-                        unflatten_externally_tagged_enums(v, prop_schema);
-                    } else {
-                        // No schema for this property - recurse without schema guidance
-                        // This handles dynamically-keyed maps like HashMap<String, Value>
-                        match v {
-                            Value::Object(_) | Value::Array(_) => {
-                                // Try to find if this is a map-type schema (additionalProperties or x-additionalProperties-original)
-                                let additional_props_schema = schema
-                                    .get("additionalProperties")
-                                    .or_else(|| schema.get("x-additionalProperties-original"));
-
-                                if let Some(additional_props_schema) = additional_props_schema {
-                                    tracing::trace!(
-                                        key = %key,
-                                        "Recursing into HashMap value with additionalProperties schema"
-                                    );
-                                    unflatten_externally_tagged_enums(v, additional_props_schema);
-                                } else {
-                                    tracing::trace!(
-                                        key = %key,
-                                        "No additionalProperties schema found for HashMap-like key"
-                                    );
+            if let Some(variants) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(|v| v.as_array())
+            {
+                if let Some(variant) = select_variant_for_object(map, variants) {
+                    if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
+                        for (k, v) in map.iter_mut() {
+                            if let Some(sub_schema) = props.get(k) {
+                                recover_internally_tagged_enums_with_root(v, sub_schema, root);
+                            }
+                        }
+                    }
+                } else {
+                    for variant in variants {
+                        if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
+                            for (k, v) in map.iter_mut() {
+                                if let Some(sub_schema) = props.get(k) {
+                                    recover_internally_tagged_enums_with_root(v, sub_schema, root);
                                 }
                             }
-                            _ => {}
                         }
                     }
                 }
+            } else if let Some(additional) = schema.get("additionalProperties") {
+                for v in map.values_mut() {
+                    recover_internally_tagged_enums_with_root(v, additional, root);
+                }
+            }
+        }
+        Value::String(_) => {
+            if recover_string_for_schema(value, schema) {
+                return;
             }
 
-            // Note: The recursive first pass above already handles unflattening enum fields
-            // by calling unflatten_externally_tagged_enums on each field, which checks if
-            // the field's schema has anyOf and calls unflatten_enum_field if needed.
-            // A second pass here would cause double-processing and corrupt already-unflattened values.
-        }
-        Value::Array(arr) => {
-            // Recursively process array elements
-            // We need to be careful here - we don't know the schema for array items
-            // without more context
-            for item in arr {
-                if let Value::Object(_) = item {
-                    if let Some(items_schema) = schema.get("items") {
-                        unflatten_externally_tagged_enums(item, items_schema);
+            if let Some(variants) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(|v| v.as_array())
+            {
+                for variant in variants {
+                    if recover_string_for_schema(value, variant) {
+                        return;
                     }
                 }
             }
@@ -1021,879 +284,234 @@ pub fn unflatten_externally_tagged_enums(value: &mut Value, schema: &Value) {
     }
 }
 
-fn extract_variant_data_from_map(
-    map: &mut serde_json::Map<String, Value>,
-    variant: &VariantInfo,
-) -> serde_json::Map<String, Value> {
-    let mut variant_data = serde_json::Map::new();
-
-    for field in &variant.all_fields {
-        // Try exact match first
-        if let Some(field_value) = map.remove(field) {
-            variant_data.insert(field.clone(), field_value);
-        } else {
-            // Try case-insensitive match with normalization (handles camelCase vs snake_case)
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for key in keys {
-                if is_variant_discriminator_match(&key, field) {
-                    if let Some(field_value) = map.remove(&key) {
-                        // Use the schema field name, not the JSON key name
-                        variant_data.insert(field.clone(), field_value);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    variant_data
+/// Coerce enum string values to the closest schema-defined value.
+pub fn coerce_enum_strings(value: &mut Value, schema: &Value) {
+    coerce_enum_strings_with_root(value, schema, schema, "$");
 }
 
-fn unflatten_variant_data(variant_data: &mut serde_json::Map<String, Value>, variant: &VariantInfo) {
-    for (field_name, field_value) in variant_data.iter_mut() {
-        if let Some(field_schema) = variant.schema
-            .get("properties")
-            .and_then(|p| p.get(field_name))
-        {
-            if let Some(nested_enum_info) = extract_enum_info(field_schema) {
-                let _ = unflatten_enum_field(field_value, &nested_enum_info);
-            }
-
-            if !value_matches_schema_shape(field_value, field_schema) {
-                if let Some(coerced) = coerce_value_to_schema(field_value, field_schema) {
-                    *field_value = coerced;
-                }
-            }
-        }
-    }
-}
-
-/// Unflatten a single enum field value
-fn unflatten_enum_field(value: &mut Value, enum_info: &EnumInfo) -> std::result::Result<(), String> {
-    let value_type = match value {
-        Value::Object(_) => "object",
-        Value::Array(_) => "array",
-        Value::String(_) => "string",
-        _ => "other",
-    };
-
-    tracing::trace!(
-        is_externally_tagged = enum_info.is_externally_tagged,
-        variants_count = enum_info.variants.len(),
-        value_type = value_type,
-        "Unflattening enum field"
-    );
-
-    if !enum_info.is_externally_tagged {
-        // Only handle externally-tagged enums for now
-        tracing::trace!("Skipping non-externally-tagged enum");
-        return Ok(());
-    }
+fn coerce_enum_strings_with_root(
+    value: &mut Value,
+    schema: &Value,
+    root: &Value,
+    path: &str,
+) {
+    let schema = deref_schema(schema, root);
 
     match value {
+        Value::Array(arr) => {
+            if let Some(items_schema) = schema.get("items") {
+                for (idx, item) in arr.iter_mut().enumerate() {
+                    let next_path = format!("{path}[{idx}]");
+                    coerce_enum_strings_with_root(item, items_schema, root, &next_path);
+                }
+            } else if let Some(prefix_items) = schema.get("prefixItems").and_then(|v| v.as_array())
+            {
+                for (idx, item) in arr.iter_mut().enumerate() {
+                    if let Some(sub_schema) = prefix_items.get(idx) {
+                        let next_path = format!("{path}[{idx}]");
+                        coerce_enum_strings_with_root(item, sub_schema, root, &next_path);
+                    }
+                }
+            }
+        }
         Value::Object(map) => {
-            tracing::trace!(field_count = map.len(), "Processing object value");
-            // Case 1: Flattened nested enum
-            // {"model": "mstl", "seasonalPeriods": [12], "trendModel": "ets"}
-            // Should become: {"model": {"Mstl": {"seasonalPeriods": [12], "trendModel": "Ets"}}}
-
-            // Try to identify which variant this represents
-            let VariantMatch {
-                variant: matched_variant,
-                single_field_key,
-            } = identify_variant_from_fields(map, &enum_info.variants)?;
-
-            tracing::trace!(
-                matched_variant = %matched_variant.name,
-                variant_fields = ?matched_variant.all_fields,
-                "Identified variant"
-            );
-
-            if let Some(single_field_key) = single_field_key {
-                if map.len() == 1 {
-                    if let Some((removed_key, mut inner_value)) =
-                        remove_case_insensitive(map, &single_field_key)
-                    {
-                        if matched_variant.is_newtype {
-                            if let Some(nested_enum_info) = extract_enum_info(&matched_variant.schema) {
-                                let _ = unflatten_enum_field(&mut inner_value, &nested_enum_info);
-                            }
-
-                            if !value_matches_schema_shape(&inner_value, &matched_variant.schema) {
-                                if let Some(coerced) =
-                                    coerce_value_to_schema(&inner_value, &matched_variant.schema)
-                                {
-                                    tracing::trace!(
-                                        variant = %matched_variant.name,
-                                        "Coerced newtype enum payload to schema defaults"
-                                    );
-                                    inner_value = coerced;
-                                }
-                            }
-
-                            let mut variant_map = serde_json::Map::new();
-                            variant_map.insert(matched_variant.name.clone(), inner_value);
-                            *value = Value::Object(variant_map);
-                            return Ok(());
-                        }
-
-                        if matched_variant.all_fields.len() == 1
-                            && !matches!(inner_value, Value::Object(_))
-                        {
-                            let field_name = &matched_variant.all_fields[0];
-                            let mut variant_data = serde_json::Map::new();
-                            variant_data.insert(field_name.clone(), inner_value);
-                            unflatten_variant_data(&mut variant_data, &matched_variant);
-
-                            let mut variant_map = serde_json::Map::new();
-                            variant_map.insert(
-                                matched_variant.name.clone(),
-                                Value::Object(variant_data),
-                            );
-                            *value = Value::Object(variant_map);
-                            return Ok(());
-                        }
-
-                        if let Value::Object(mut inner_map) = inner_value {
-                            let mut variant_data =
-                                extract_variant_data_from_map(&mut inner_map, &matched_variant);
-                            unflatten_variant_data(&mut variant_data, &matched_variant);
-
-                            let mut variant_map = serde_json::Map::new();
-                            variant_map.insert(
-                                matched_variant.name.clone(),
-                                Value::Object(variant_data),
-                            );
-                            *value = Value::Object(variant_map);
-                            return Ok(());
-                        }
-
-                        map.insert(removed_key, inner_value);
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                let additional = schema.get("additionalProperties");
+                for (k, v) in map.iter_mut() {
+                    if let Some(sub_schema) = props.get(k) {
+                        let next_path = format!("{path}.{k}");
+                        coerce_enum_strings_with_root(v, sub_schema, root, &next_path);
+                    } else if let Some(additional) = additional {
+                        let next_path = format!("{path}.{k}");
+                        coerce_enum_strings_with_root(v, additional, root, &next_path);
                     }
                 }
+                return;
             }
 
-            // Special handling for nested enums:
-            // If the variant has a single field and that field's value in the map is a string
-            // that doesn't match the variant name, it might be a nested enum discriminator
-            if matched_variant.all_fields.len() == 1 {
-                let field_name = &matched_variant.all_fields[0];
-
-                tracing::trace!(
-                    single_field = %field_name,
-                    has_properties = matched_variant.schema.get("properties").is_some(),
-                    "Checking for nested enum in single-field variant"
-                );
-
-                // For newtype variants wrapping an enum, the schema itself is the enum schema
-                // (it has anyOf directly, not inside properties)
-                let field_schema = if matched_variant.is_newtype
-                    && (matched_variant.schema.get("anyOf").is_some()
-                        || matched_variant.schema.get("oneOf").is_some())
-                {
-                    Some(&matched_variant.schema)
+            if let Some(variants) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(|v| v.as_array())
+            {
+                if let Some(variant) = select_variant_for_object(map, variants) {
+                    coerce_enum_strings_with_root(value, variant, root, path);
                 } else {
-                    matched_variant.schema
-                        .get("properties")
-                        .and_then(|p| p.get(field_name))
-                };
-
-                if let Some(field_schema) = field_schema {
-                    // Check if this field's schema is also an enum (has anyOf)
-                    if let Some(nested_enum_info) = extract_enum_info(field_schema) {
-                        tracing::trace!(
-                            field = %field_name,
-                            nested_variants = nested_enum_info.variants.len(),
-                            "Found nested enum in variant field"
-                        );
-
-                        // The current map might have:
-                        // Field from outer variant (e.g., "model") with a string value that's actually
-                        // a discriminator for the inner enum, PLUS fields from the inner enum's variant
-
-                        // Strategy: Remove the outer field, treat remaining fields as the nested enum
-                        let discriminator_value = get_case_insensitive_value(map, field_name)
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-
-                        tracing::trace!(
-                            discriminator_field = %field_name,
-                            discriminator_value = ?discriminator_value,
-                            all_fields = ?map.keys().collect::<Vec<_>>(),
-                            "Processing nested enum with discriminator"
-                        );
-
-                        // Remove the discriminator field from map and collect remaining fields
-                        let removed_field = remove_case_insensitive(map, field_name);
-
-                        tracing::trace!(
-                            remaining_fields = ?map.keys().collect::<Vec<_>>(),
-                            "Fields after removing discriminator"
-                        );
-
-                        // The remaining fields should form the nested enum
-                        let mut nested_value = if map.is_empty() {
-                            discriminator_value
-                                .clone()
-                                .map(Value::String)
-                                .unwrap_or_else(|| Value::Object(map.clone()))
-                        } else {
-                            Value::Object(map.clone())
-                        };
-
-                        // Recursively unflatten the nested enum
-                        if unflatten_enum_field(&mut nested_value, &nested_enum_info).is_ok() {
-                            // Successfully unflattened the nested enum
-                            // Now wrap it in the outer variant
-                            let mut variant_map = serde_json::Map::new();
-                            variant_map.insert(matched_variant.name.clone(), nested_value);
-                            *value = Value::Object(variant_map);
-
-                            tracing::trace!(
-                                outer_variant = %matched_variant.name,
-                                "Successfully restructured nested enum"
-                            );
-                            return Ok(());
-                        } else {
-                            // Restore the discriminator field if unflatten failed
-                            if let Some((orig_key, _)) = removed_field {
-                                if let Some(disc_val) = discriminator_value {
-                                    map.insert(orig_key, Value::String(disc_val));
-                                }
-                            }
-                        }
+                    for variant in variants {
+                        coerce_enum_strings_with_root(value, variant, root, path);
                     }
                 }
+            } else if let Some(additional) = schema.get("additionalProperties") {
+                for (k, v) in map.iter_mut() {
+                    let next_path = format!("{path}.{k}");
+                    coerce_enum_strings_with_root(v, additional, root, &next_path);
+                }
             }
-
-            // Standard externally-tagged enum restructuring
-            // Extract the variant data
-            let mut variant_data = extract_variant_data_from_map(map, &matched_variant);
-
-            // Recursively unflatten any nested enums in variant_data
-            unflatten_variant_data(&mut variant_data, &matched_variant);
-
-            // Restructure as externally-tagged enum
-            let mut variant_map = serde_json::Map::new();
-
-            if matched_variant.is_unit {
-                // Unit variant - the value should just be the variant name as a string
-                *value = Value::String(matched_variant.name.clone());
-            } else if matched_variant.is_newtype && variant_data.is_empty() {
-                // Newtype variant - check if there's a single non-variant-name field
-                // This is tricky - we need to identify the wrapped value
-                // For now, keep the structure as-is
-                return Ok(());
-            } else {
-                // Struct variant
-                variant_map.insert(matched_variant.name.clone(), Value::Object(variant_data));
-                *value = Value::Object(variant_map);
-            }
-
-            Ok(())
         }
         Value::String(s) => {
-            if let Some(converted) = external_enum_value_from_string(s, enum_info) {
-                *value = converted;
-                return Ok(());
+            let current = s.clone();
+            if let Some(coerced) = coerce_string_enum_value(&current, schema) {
+                if coerced.as_str() != Some(current.as_str()) {
+                    debug!(
+                        value.path = path,
+                        value.from = %current,
+                        value.to = %coerced,
+                        "Coerced enum string to schema value"
+                    );
+                    *value = coerced;
+                    return;
+                }
             }
-            Ok(())
-        }
-        Value::Array(arr) => {
-            // Array format for tuple struct
-            // ["value1", "value2"] should become {"VariantName": {"field1": "value1", "field2": "value2"}}
 
-            // Try to match array length to variant field count
-            for variant in &enum_info.variants {
-                if variant.all_fields.len() == arr.len() {
-                    if variant.all_fields.len() == 1 {
-                        let field_name = &variant.all_fields[0];
-                        let field_is_array = variant
-                            .schema
-                            .get("properties")
-                            .and_then(|p| p.get(field_name))
-                            .and_then(|s| s.get("type"))
-                            .and_then(|t| t.as_str())
-                            == Some("array");
-
-                        if field_is_array && arr.len() > 1 {
-                            continue;
+            if let Some(variants) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(|v| v.as_array())
+            {
+                for variant in variants {
+                    if let Some(coerced) = coerce_string_enum_value(&current, variant) {
+                        if coerced.as_str() != Some(current.as_str()) {
+                            debug!(
+                                value.path = path,
+                                value.from = %current,
+                                value.to = %coerced,
+                                "Coerced enum string to schema value"
+                            );
+                            *value = coerced;
+                            return;
                         }
                     }
-
-                    let mut variant_data = serde_json::Map::new();
-                    for (field_name, field_value) in variant.all_fields.iter().zip(arr.iter()) {
-                        variant_data.insert(field_name.clone(), field_value.clone());
-                    }
-
-                    let mut variant_map = serde_json::Map::new();
-                    variant_map.insert(variant.name.clone(), Value::Object(variant_data));
-                    *value = Value::Object(variant_map);
-
-                    return Ok(());
                 }
             }
-
-            // Single field array wrapper
-            for variant in &enum_info.variants {
-                if variant.all_fields.len() == 1 {
-                    let field_name = &variant.all_fields[0];
-                    let field_schema = variant
-                        .schema
-                        .get("properties")
-                        .and_then(|p| p.get(field_name));
-                    let field_is_array = field_schema
-                        .map(|s| {
-                            s.get("type").and_then(|t| t.as_str()) == Some("array")
-                                || s.get("type").is_none()
-                        })
-                        .unwrap_or(false);
-
-                    if field_is_array {
-                        tracing::debug!(
-                            variant = %variant.name,
-                            field = %field_name,
-                            array_len = arr.len(),
-                            "wrapping flat array into single-field variant"
-                        );
-
-                        let mut variant_data = serde_json::Map::new();
-                        variant_data.insert(field_name.clone(), Value::Array(arr.clone()));
-
-                        let mut variant_map = serde_json::Map::new();
-                        variant_map.insert(variant.name.clone(), Value::Object(variant_data));
-                        *value = Value::Object(variant_map);
-                        return Ok(());
-                    }
-                }
-            }
-
-            Err(format!("Could not match array of length {} to any variant", arr.len()))
         }
-        _ => Ok(()),
+        _ => {}
     }
 }
 
-/// Check if a string value could be a discriminator for a variant name.
-/// Returns true if they match with only case/separator differences (e.g., "auto" vs "Auto",
-/// "simpleAverage" vs "SimpleAverage"), but false if they're completely different strings
-/// (e.g., "mstl" vs "Model").
-fn is_variant_discriminator_match(value: &str, variant_name: &str) -> bool {
-    // Normalize both strings by converting to lowercase and removing separators
-    let normalize = |s: &str| -> String {
-        s.chars()
-            .filter(|c| c.is_alphanumeric())
-            .map(|c| c.to_ascii_lowercase())
-            .collect()
-    };
-
-    normalize(value) == normalize(variant_name)
-}
-
-fn get_case_insensitive_value<'a>(
-    map: &'a Map<String, Value>,
-    key: &str,
-) -> Option<&'a Value> {
-    map.iter()
-        .find(|(k, _)| is_variant_discriminator_match(k, key))
-        .map(|(_, v)| v)
-}
-
-fn remove_case_insensitive(
-    map: &mut Map<String, Value>,
-    key: &str,
-) -> Option<(String, Value)> {
-    let match_key = map
-        .keys()
-        .find(|k| is_variant_discriminator_match(k, key))
-        .cloned();
-
-    match_key.and_then(|k| map.remove(&k).map(|v| (k, v)))
-}
-
-fn default_object_for_schema(schema: &Value) -> Option<Value> {
-    let any_of = schema
-        .get("x-anyOf-original")
-        .or_else(|| schema.get("anyOf"))
-        .or_else(|| schema.get("oneOf"))
-        .and_then(|v| v.as_array());
-
-    if let Some(variants) = any_of {
-        for variant in variants {
-            if let Some(obj) = default_object_for_schema(variant) {
-                return Some(obj);
-            }
-        }
+fn coerce_string_enum_value(input: &str, schema: &Value) -> Option<Value> {
+    let candidates = enum_candidates(schema);
+    if candidates.is_empty() {
         return None;
     }
 
-    let props = schema.get("properties").and_then(|v| v.as_object())?;
-    let required = schema.get("required").and_then(|v| v.as_array());
-    let mut map = Map::new();
+    let input_norm = normalize_tag(input);
+    let mut best: Option<(usize, String)> = None;
 
-    if let Some(required) = required {
-        for field in required.iter().filter_map(|v| v.as_str()) {
-            if let Some(field_schema) = props.get(field) {
-                map.insert(field.to_string(), default_value_for_schema(field_schema));
+    for candidate in candidates {
+        if input == candidate {
+            return Some(Value::String(candidate));
+        }
+
+        let cand_norm = normalize_tag(&candidate);
+        if input_norm == cand_norm {
+            return Some(Value::String(candidate));
+        }
+
+        if input_norm.starts_with(&cand_norm) && cand_norm.len() >= 3 {
+            return Some(Value::String(candidate));
+        }
+        if cand_norm.starts_with(&input_norm) && input_norm.len() >= 3 {
+            return Some(Value::String(candidate));
+        }
+
+        let prefix_len = common_prefix_len(&input_norm, &cand_norm);
+        if prefix_len >= 3 {
+            let dist = levenshtein(&input_norm, &cand_norm);
+            let max_len = input_norm.len().max(cand_norm.len());
+            let threshold = (max_len / 2).max(2).min(8);
+            if dist <= threshold {
+                if best.as_ref().map_or(true, |(best_dist, _)| dist < *best_dist) {
+                    best = Some((dist, candidate));
+                }
             }
         }
     }
 
-    Some(Value::Object(map))
+    best.map(|(_, candidate)| Value::String(candidate))
 }
 
-fn default_value_for_schema(schema: &Value) -> Value {
-    if let Some(default) = schema.get("default") {
-        return default.clone();
+fn enum_candidates(schema: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+
+    if let Some(Value::String(const_val)) = schema.get("const") {
+        values.push(const_val.clone());
     }
 
-    if let Some(const_val) = schema.get("const") {
-        return const_val.clone();
-    }
-
-    if let Some(enums) = schema.get("enum").and_then(|v| v.as_array()) {
-        if let Some(first) = enums.first() {
-            return first.clone();
+    if let Some(Value::Array(enums)) = schema.get("enum") {
+        for v in enums {
+            if let Some(s) = v.as_str() {
+                values.push(s.to_string());
+            }
         }
     }
 
-    if let Some(any_of) = schema
-        .get("x-anyOf-original")
-        .or_else(|| schema.get("anyOf"))
-        .or_else(|| schema.get("oneOf"))
-        .and_then(|v| v.as_array())
-    {
-        if let Some(first) = any_of.first() {
-            return default_value_for_schema(first);
-        }
-    }
-
-    if let Some(obj) = default_object_for_schema(schema) {
-        return obj;
-    }
-
-    match schema.get("type").and_then(|v| v.as_str()) {
-        Some("string") => Value::String(String::new()),
-        Some("integer") | Some("number") => Value::Number(0.into()),
-        Some("boolean") => Value::Bool(false),
-        Some("array") => Value::Array(Vec::new()),
-        Some("object") => Value::Object(Map::new()),
-        Some("null") => Value::Null,
-        _ => Value::Null,
-    }
+    values
 }
 
-fn coerce_value_to_schema(value: &Value, schema: &Value) -> Option<Value> {
-    if value_matches_schema_shape(value, schema) {
-        return Some(value.clone());
-    }
-
-    if let (Value::String(s), Some(type_name)) =
-        (value, schema.get("type").and_then(|v| v.as_str()))
-    {
-        match type_name {
-            "number" => {
-                if let Ok(parsed) = s.parse::<f64>() {
-                    return Some(Value::Number(serde_json::Number::from_f64(parsed)?));
-                }
-            }
-            "integer" => {
-                if let Ok(parsed) = s.parse::<i64>() {
-                    return Some(Value::Number(parsed.into()));
-                }
-            }
-            "boolean" => {
-                let normalized = s.trim().to_ascii_lowercase();
-                if normalized == "true" {
-                    return Some(Value::Bool(true));
-                }
-                if normalized == "false" {
-                    return Some(Value::Bool(false));
-                }
-            }
-            _ => {}
+fn deref_schema<'a>(schema: &'a Value, root: &'a Value) -> &'a Value {
+    if let Some(reference) = schema.get("$ref").and_then(|v| v.as_str()) {
+        if let Some(resolved) = resolve_pointer(root, reference) {
+            return resolved;
         }
     }
-
-    if let Some(enum_info) = extract_enum_info(schema) {
-        if enum_info.is_externally_tagged {
-            match value {
-                Value::String(s) => {
-                    if let Some(converted) = external_enum_value_from_string(s, &enum_info) {
-                        return Some(converted);
-                    }
-                }
-                Value::Object(map) => {
-                    if let Some(converted) = external_enum_value_from_tagged_object(map, &enum_info)
-                    {
-                        return Some(converted);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Some(default_value_for_schema(schema))
+    schema
 }
 
-fn map_has_field(map: &Map<String, Value>, field: &str) -> bool {
-    map.keys()
-        .any(|key| is_variant_discriminator_match(key, field))
+fn resolve_pointer<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix('#').unwrap_or(reference);
+    root.pointer(pointer)
 }
 
-fn fill_required_fields_from_schema(variant: &VariantInfo, data: &mut Map<String, Value>) {
-    let props = match variant.schema.get("properties").and_then(|v| v.as_object()) {
-        Some(props) => props,
-        None => return,
+fn recover_string_for_schema(value: &mut Value, schema: &Value) -> bool {
+    let input = match value.as_str() {
+        Some(s) => s.to_string(),
+        None => return false,
     };
 
-    for required_field in &variant.identifying_fields {
-        if map_has_field(data, required_field) {
-            continue;
-        }
-
-        if let Some(field_schema) = props.get(required_field) {
-            data.insert(
-                required_field.clone(),
-                default_value_for_schema(field_schema),
-            );
-        }
-    }
-}
-
-fn external_enum_value_from_string(value: &str, enum_info: &EnumInfo) -> Option<Value> {
-    let variant = enum_info
-        .variants
-        .iter()
-        .find(|v| is_variant_discriminator_match(value, &v.name))?;
-
-    if variant.is_unit {
-        return Some(Value::String(variant.name.clone()));
-    }
-
-    let mut variant_data = Map::new();
-    fill_required_fields_from_schema(variant, &mut variant_data);
-
-    Some(Value::Object({
-        let mut map = Map::new();
-        map.insert(variant.name.clone(), Value::Object(variant_data));
-        map
-    }))
-}
-
-fn external_enum_value_from_tagged_object(
-    map: &Map<String, Value>,
-    enum_info: &EnumInfo,
-) -> Option<Value> {
-    let (tag_key, tag_value) = map.iter().find_map(|(key, value)| {
-        let value = value.as_str()?;
-        if enum_info
-            .variants
-            .iter()
-            .any(|variant| is_variant_discriminator_match(value, &variant.name))
-        {
-            Some((key.clone(), value.to_string()))
-        } else {
-            None
-        }
-    })?;
-
-    let variant = enum_info
-        .variants
-        .iter()
-        .find(|v| is_variant_discriminator_match(&tag_value, &v.name))?;
-
-    if variant.is_unit {
-        return Some(Value::String(variant.name.clone()));
-    }
-
-    let mut remaining = map.clone();
-    remaining.remove(&tag_key);
-    let mut variant_data = extract_variant_data_from_map(&mut remaining, variant);
-    fill_required_fields_from_schema(variant, &mut variant_data);
-
-    Some(Value::Object({
-        let mut wrapped = Map::new();
-        wrapped.insert(variant.name.clone(), Value::Object(variant_data));
-        wrapped
-    }))
-}
-
-fn value_matches_schema_shape(value: &Value, schema: &Value) -> bool {
-    let any_of = schema
-        .get("x-anyOf-original")
-        .or_else(|| schema.get("anyOf"))
-        .and_then(|v| v.as_array());
-
-    if let Some(variants) = any_of {
-        return variants
-            .iter()
-            .any(|variant| value_matches_schema_shape(value, variant));
-    }
-
-    if let Some(type_name) = schema.get("type").and_then(|v| v.as_str()) {
-        return match (type_name, value) {
-            ("object", Value::Object(_)) => true,
-            ("array", Value::Array(_)) => true,
-            ("string", Value::String(_)) => true,
-            ("number", Value::Number(_)) => true,
-            ("integer", Value::Number(n)) => n.is_i64() || n.is_u64(),
-            ("boolean", Value::Bool(_)) => true,
-            ("null", Value::Null) => true,
-            _ => false,
-        };
-    }
-
-    if schema.get("properties").is_some() {
-        return matches!(value, Value::Object(_));
-    }
-
-    if schema.get("enum").is_some() || schema.get("const").is_some() {
-        return matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_));
-    }
-
-    true
-}
-
-fn value_contains_variant_data(value: &Value, variant: &VariantInfo) -> bool {
-    if variant.is_unit {
-        return matches!(value, Value::Null) ||
-            matches!(value, Value::Object(map) if map.is_empty());
-    }
-
-    if variant.is_newtype {
-        return value_matches_schema_shape(value, &variant.schema);
-    }
-
-    let has_required = variant.schema.get("required").is_some();
-
-    match value {
-        Value::Object(map) => {
-            if variant.all_fields.is_empty() {
-                return true;
-            }
-
-            if has_required {
-                variant.identifying_fields.iter().all(|field| {
-                    map.keys()
-                        .any(|key| is_variant_discriminator_match(key, field))
-                })
-            } else {
-                variant.all_fields.iter().any(|field| {
-                    map.keys()
-                        .any(|key| is_variant_discriminator_match(key, field))
-                })
-            }
-        }
-        _ => false,
-    }
-}
-
-fn field_present(present_fields: &[String], field: &str) -> bool {
-    present_fields
-        .iter()
-        .any(|present| is_variant_discriminator_match(present, field))
-}
-
-/// Identify which variant a flattened object represents
-fn identify_variant_from_fields(
-    map: &serde_json::Map<String, Value>,
-    variants: &[VariantInfo],
-) -> std::result::Result<VariantMatch, String> {
-    let present_fields: Vec<String> = map.keys().cloned().collect();
-
-    tracing::trace!(
-        present_fields = ?present_fields,
-        variants_count = variants.len(),
-        "Identifying variant from fields"
-    );
-
-    for (i, variant) in variants.iter().enumerate() {
-        tracing::trace!(
-            variant_index = i,
-            variant_name = %variant.name,
-            variant_fields = ?variant.all_fields,
-            variant_required = ?variant.identifying_fields,
-            is_unit = variant.is_unit,
-            "Checking variant"
+    if let Some((tag_field, tag_value)) = find_tag_field(schema, &input) {
+        debug!(
+            tag_field = %tag_field,
+            tag_value = %tag_value,
+            "Recovering internally tagged enum from string"
         );
+        *value = json!({ tag_field: tag_value });
+        return true;
     }
 
-    // Special case: Empty object after null pruning - match to unit variant if available
-    if present_fields.is_empty() {
-        let unit_variants: Vec<_> = variants.iter().filter(|v| v.is_unit).collect();
-        if let Some(unit_variant) = unit_variants.first() {
-            tracing::trace!(
-                variant_name = %unit_variant.name,
-                "Matched empty object to unit variant"
-            );
-            return Ok(VariantMatch {
-                variant: (*unit_variant).clone(),
-                single_field_key: None,
-            });
-        }
-    }
-
-    // Strategy 0: Single field whose name matches variant name
-    // Pattern: {"calculation": [...]} -> Calculation variant
-    // BUT: avoid matching if the variant has a field with the same name
-    // (e.g., Calculation variant with a "calculation" field)
-    if present_fields.len() == 1 {
-        let field_name = &present_fields[0];
-        for variant in variants {
-            if is_variant_discriminator_match(field_name, &variant.name) {
-                // Check if this variant has a field with the same name
-                let has_same_name_field = variant.all_fields.iter()
-                    .any(|f| is_variant_discriminator_match(f, field_name));
-
-                let value_matches = map.get(field_name)
-                    .map(|value| value_contains_variant_data(value, variant))
-                    .unwrap_or(false);
-
-                let allow_single_field_collapse = variant.all_fields.len() == 1
-                    && map.get(field_name)
-                        .map(|value| !matches!(value, Value::Object(_)))
-                        .unwrap_or(false);
-
-                if (!has_same_name_field || variant.is_newtype || variant.is_unit)
-                    && (value_matches
-                        || variant.is_newtype
-                        || variant.is_unit
-                        || allow_single_field_collapse)
-                {
-                    tracing::trace!(
-                        field_name = %field_name,
-                        variant_name = %variant.name,
-                        "Matched single field name to variant (no field collision)"
-                    );
-                    return Ok(VariantMatch {
-                        variant: variant.clone(),
-                        single_field_key: Some(field_name.clone()),
-                    });
-                }
-            }
-        }
-    }
-
-    // Strategy 1: Look for a discriminator field that matches a variant name
-    // Common patterns: "type": "auto" -> Auto, "type": "simpleAverage" -> SimpleAverage
-    for (key, value) in map.iter() {
-        if let Some(s) = value.as_str() {
-            // Check if this string value matches a variant name
-            // Use stricter matching - the strings should be the same modulo casing/separators
-            for variant in variants {
-                if is_variant_discriminator_match(s, &variant.name) {
-                    // Found a discriminator! This is likely the variant
-                    // Verify that other fields match
-                    let other_fields: Vec<_> = present_fields.iter()
-                        .filter(|f| *f != key)
-                        .cloned()
-                        .collect();
-
-                    let matches = other_fields.iter().all(|f| {
-                        variant.all_fields
-                            .iter()
-                            .any(|vf| is_variant_discriminator_match(vf, f))
-                    });
-
-                    if matches || other_fields.is_empty() {
-                        return Ok(VariantMatch {
-                            variant: variant.clone(),
-                            single_field_key: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Strategy 2: Match based on field presence (with tolerance for nested enum fields)
-    // Find the variant whose required fields are all present
-    let mut best_match: Option<&VariantInfo> = None;
-    let mut best_score = 0;
-
-    for variant in variants {
-        let required_present = variant.identifying_fields.iter()
-            .filter(|f| field_present(&present_fields, f))
-            .count();
-
-        let all_present = variant.all_fields.iter()
-            .filter(|f| field_present(&present_fields, f))
-            .count();
-
-        // Score: prioritize variants where all required fields are present
-        // Special handling: if all required fields are present, this could be a match
-        // even if there are extra fields (which might belong to a nested enum)
-        let score = if required_present == variant.identifying_fields.len() {
-            // All required fields match - give high score
-            required_present * 1000 + all_present * 10
-        } else {
-            // Not all required fields present - low score
-            all_present
-        };
-
-        if score > best_score {
-            best_score = score;
-            best_match = Some(variant);
-        }
-    }
-
-    if let Some(variant) = best_match {
-        // Additional validation: check if extra fields might belong to a nested enum
-        if variant.all_fields.len() == 1 {
-            // Single-field variant - could have nested enum
-            // Accept even if there are extra fields
-            return Ok(VariantMatch {
-                variant: variant.clone(),
-                single_field_key: None,
-            });
-        } else if best_score >= 1000 {
-            // All required fields matched
-            return Ok(VariantMatch {
-                variant: variant.clone(),
-                single_field_key: None,
-            });
-        }
-    }
-
-    // Strategy 3: If all else fails, find variant with most overlapping fields
-    for variant in variants {
-        let overlap = variant.all_fields.iter()
-            .filter(|f| field_present(&present_fields, f))
-            .count();
-
-        if overlap > best_score {
-            best_score = overlap;
-            best_match = Some(variant);
-        }
-    }
-
-    best_match
-        .cloned()
-        .map(|variant| VariantMatch {
-            variant,
-            single_field_key: None,
-        })
-        .ok_or_else(|| format!("Could not identify variant from fields: {:?}", present_fields))
+    false
 }
 
-/// Helper to check if a schema node allows a specific string value.
-/// Used to match collapsed string values against schema constraints.
-fn schema_matches_string_value(schema: &Value, target: &str) -> Option<String> {
-    // Case 1: "const": "mstl"
-    if let Some(c) = schema.get("const").and_then(|v| v.as_str()) {
-        if c.eq_ignore_ascii_case(target) {
-            return Some(c.to_string());
+fn find_tag_field(schema: &Value, input: &str) -> Option<(String, Value)> {
+    let props = schema.get("properties")?.as_object()?;
+    let required = schema.get("required").and_then(|v| v.as_array());
+
+    for (prop_name, prop_schema) in props {
+        let matched = schema_matches_string_value(prop_schema, input)?;
+        let is_required = required
+            .map(|req| req.iter().any(|v| v.as_str() == Some(prop_name)))
+            .unwrap_or(false);
+        let is_tag_name = TAG_FIELD_NAMES.contains(&prop_name.as_str());
+
+        if is_required || is_tag_name {
+            return Some((prop_name.clone(), matched));
         }
     }
 
-    // Case 2: "enum": ["mstl", "auto", "ets"]
+    None
+}
+
+fn schema_matches_string_value(schema: &Value, input: &str) -> Option<Value> {
+    if let Some(const_val) = schema.get("const").and_then(|v| v.as_str()) {
+        if normalize_tag(const_val) == normalize_tag(input) {
+            return Some(Value::String(const_val.to_string()));
+        }
+    }
+
     if let Some(enums) = schema.get("enum").and_then(|v| v.as_array()) {
-        for e in enums {
-            if let Some(e_str) = e.as_str() {
-                if e_str.eq_ignore_ascii_case(target) {
-                    return Some(e_str.to_string());
+        for val in enums {
+            if let Some(s) = val.as_str() {
+                if normalize_tag(s) == normalize_tag(input) {
+                    return Some(Value::String(s.to_string()));
                 }
             }
         }
@@ -1902,244 +520,60 @@ fn schema_matches_string_value(schema: &Value, target: &str) -> Option<String> {
     None
 }
 
-fn array_to_object_by_properties(
-    arr: &mut Vec<Value>,
-    props: &Map<String, Value>,
-    required_len: usize,
-) -> Option<Value> {
-    if arr.is_empty() || arr.len() > props.len() || arr.len() < required_len {
-        return None;
-    }
-
-    let mut new_map = Map::new();
-    let mut iter = arr.drain(..);
-
-    for (key, sub_schema) in props {
-        if let Some(mut item) = iter.next() {
-            recover_internally_tagged_enums(&mut item, sub_schema);
-            new_map.insert(key.clone(), item);
-        } else {
-            break;
-        }
-    }
-
-    Some(Value::Object(new_map))
+fn normalize_tag(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
-fn variant_properties_for_array<'a>(
+fn select_variant_for_object<'a>(
+    map: &Map<String, Value>,
     variants: &'a [Value],
-    arr_len: usize,
-) -> Option<(&'a Map<String, Value>, usize)> {
-    let mut fallback = None;
-
-    for variant in variants {
-        let props = match variant.get("properties").and_then(|p| p.as_object()) {
-            Some(props) => props,
-            None => continue,
-        };
-
-        if arr_len == 0 || arr_len > props.len() {
-            continue;
-        }
-
-        let required_len = variant
-            .get("required")
-            .and_then(|r| r.as_array())
-            .map_or(0, |r| r.len());
-
-        if arr_len == props.len() {
-            return Some((props, required_len));
-        }
-
-        if arr_len >= required_len && fallback.is_none() {
-            fallback = Some((props, required_len));
-        }
-    }
-
-    fallback
+) -> Option<&'a Value> {
+    let keys: Vec<&String> = map.keys().collect();
+    variants.iter().find(|variant| {
+        variant
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map_or(false, |props| keys.iter().all(|key| props.contains_key(*key)))
+    })
 }
 
-/// Recursively attempts to recover internally tagged enums where the LLM
-/// output a string literal instead of the wrapper object.
-///
-/// Example: matches "mstl" against a schema expecting { "type": "mstl" }
-/// and rewrites the JSON value to match the schema.
-///
-/// This handles Gemini's tendency (especially with Flash models) to collapse
-/// objects with single discriminator fields into just the string value.
-pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
-    match value {
-        Value::Array(arr) => {
-            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-                let required_len = schema
-                    .get("required")
-                    .and_then(|r| r.as_array())
-                    .map_or(0, |r| r.len());
-                if let Some(obj) = array_to_object_by_properties(arr, props, required_len) {
-                    *value = obj;
-                    return;
-                }
-            } else if let Some(variants) = schema
-                .get("anyOf")
-                .or_else(|| schema.get("oneOf"))
-                .and_then(|v| v.as_array())
-            {
-                if let Some((props, required_len)) =
-                    variant_properties_for_array(variants, arr.len())
-                {
-                    if let Some(obj) = array_to_object_by_properties(arr, props, required_len) {
-                        *value = obj;
-                        return;
-                    }
-                }
-            }
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(ca, cb)| ca == cb)
+        .count()
+}
 
-            // Handle arrays: check if schema defines items
-            if let Some(items_schema) = schema.get("items") {
-                for item in arr {
-                    recover_internally_tagged_enums(item, items_schema);
-                }
-            } else if let Some(prefix_items) = schema.get("prefixItems").and_then(|v| v.as_array())
-            {
-                // Handle tuple structs / prefixItems
-                for (i, item) in arr.iter_mut().enumerate() {
-                    if let Some(sub_schema) = prefix_items.get(i) {
-                        recover_internally_tagged_enums(item, sub_schema);
-                    }
-                }
-            }
-        }
-        Value::Object(map) => {
-            if let Some(enum_info) = extract_enum_info(schema) {
-                if enum_info.is_externally_tagged {
-                    if let Some(converted) = external_enum_value_from_tagged_object(map, &enum_info) {
-                        *value = converted;
-                        return;
-                    }
-                }
-            }
-
-            // Handle standard objects: recurse into properties
-            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-                for (k, v) in map {
-                    if let Some(sub_schema) = props.get(k) {
-                        recover_internally_tagged_enums(v, sub_schema);
-                    }
-                }
-            }
-            // Handle enums/unions with object variants
-            else if let Some(variants) = schema
-                .get("anyOf")
-                .or_else(|| schema.get("oneOf"))
-                .and_then(|v| v.as_array())
-            {
-                for variant in variants {
-                    if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
-                        let matches = map.keys().all(|k| props.contains_key(k));
-                        if matches {
-                            for (k, v) in map {
-                                if let Some(sub_schema) = props.get(k) {
-                                    recover_internally_tagged_enums(v, sub_schema);
-                                }
-                            }
-                            return;
-                        }
-                    }
-                }
-                let keys: Vec<String> = map.keys().cloned().collect();
-                let mut visited = HashSet::new();
-
-                for variant in variants {
-                    if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
-                        for key in &keys {
-                            if visited.contains(key) {
-                                continue;
-                            }
-                            if let Some(sub_schema) = props.get(key) {
-                                if let Some(value) = map.get_mut(key) {
-                                    recover_internally_tagged_enums(value, sub_schema);
-                                    visited.insert(key.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Handle Normalized Maps: Data is Object, but Schema is Gemini KV-Array
-            // ({type: "array", items: {properties: {__key__, __value__}}})
-            // This mismatch occurs because normalize_json_response runs before this function,
-            // converting the KV-Array back into a Map, but the schema is still in Array format.
-            else if let Some(items) = schema.get("items") {
-                // If the schema describes the special KV-pair structure, apply
-                // the "__value__" sub-schema to all values in the normalized map.
-                if let Some(value_schema) = items
-                    .get("properties")
-                    .and_then(|p| p.get("__value__"))
-                {
-                    for v in map.values_mut() {
-                        recover_internally_tagged_enums(v, value_schema);
-                    }
-                }
-            }
-        }
-        Value::String(s) => {
-            if let Some(enum_info) = extract_enum_info(schema) {
-                if enum_info.is_externally_tagged {
-                    if let Some(converted) = external_enum_value_from_string(s, &enum_info) {
-                        *value = converted;
-                        return;
-                    }
-                }
-            }
-
-            // THE FIX: Check if this string should actually be an object
-            // This happens when serde(tag=...) is used and the LLM optimizes away the wrapper.
-
-            // Check if we are inside a oneOf/anyOf
-            let variants = schema
-                .get("oneOf")
-                .or_else(|| schema.get("anyOf"))
-                .and_then(|v| v.as_array());
-
-            if let Some(variants) = variants {
-                for variant in variants {
-                    // We are looking for a variant that is an OBJECT containing a property
-                    // that matches our string exactly.
-                    if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
-                        for (prop_name, prop_schema) in props {
-                            // Does this property match our string?
-                            if let Some(matched) = schema_matches_string_value(prop_schema, s) {
-                                // Found it! Transform "val" -> { "tag": "val" }
-                                debug!(
-                                    "Recovering internally tagged enum: expanded string '{}' to object with tag '{}'",
-                                    s, prop_name
-                                );
-                                *value = json!({ prop_name: matched });
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Also check the root properties case (less common for enums but possible)
-            if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
-                for (prop_name, prop_schema) in props {
-                    if let Some(matched) = schema_matches_string_value(prop_schema, s) {
-                        // Check if this property is REQUIRED. If so, and we only have a string,
-                        // the LLM likely collapsed the object to this single identifying property.
-                        if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
-                            if req.contains(&json!(prop_name)) {
-                                *value = json!({ prop_name: matched });
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_len = a.len();
+    let b_len = b.len();
+    if a_len == 0 {
+        return b_len;
     }
+    if b_len == 0 {
+        return a_len;
+    }
+
+    let mut prev: Vec<usize> = (0..=b_len).collect();
+    let mut curr = vec![0; b_len + 1];
+
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = std::cmp::min(
+                std::cmp::min(curr[j] + 1, prev[j + 1] + 1),
+                prev[j] + cost,
+            );
+        }
+        prev.clone_from_slice(&curr);
+    }
+
+    curr[b_len]
 }
 
 /// Convert an OpenAPI-style schema (with nullable: true) to a standard JSON Schema
@@ -2176,12 +610,10 @@ fn to_standard_json_schema(mut schema: Value) -> Value {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 mod tests {
     use super::*;
     use schemars::JsonSchema;
     use serde_json::json;
-    use std::collections::HashMap;
 
     #[derive(JsonSchema)]
     struct Contact {
@@ -2189,1080 +621,102 @@ mod tests {
     }
 
     #[test]
-    fn option_fields_keep_nullable_flag() {
-        let contact = Contact {
-            phone: Some("123".to_string()),
-        };
-        // Read the field to avoid dead-code warnings while keeping the shape realistic.
-        assert_eq!(contact.phone.as_deref(), Some("123"));
-
-        let schema = Contact::gemini_schema();
-        let phone_schema = schema
-            .get("properties")
-            .and_then(|p| p.get("phone"))
-            .expect("phone schema should exist");
-
-        assert_eq!(phone_schema.get("type"), Some(&json!("string")));
-        assert_eq!(phone_schema.get("nullable"), Some(&json!(true)));
-    }
-
-    #[test]
-    fn to_standard_json_schema_handles_nullable() {
-        let openapi_schema = json!({
-            "type": "string",
-            "nullable": true
-        });
-
-        let standard = to_standard_json_schema(openapi_schema);
-        assert_eq!(standard.get("nullable"), None);
-        let types = standard
-            .get("type")
-            .and_then(|t| t.as_array())
-            .expect("type should be array");
-        assert!(types.contains(&json!("string")));
-        assert!(types.contains(&json!("null")));
-    }
-
-    #[derive(JsonSchema)]
-    struct MapWrapper {
-        map: HashMap<String, String>,
-    }
-
-    #[test]
-    fn map_schemas_transform_to_array() {
-        let schema = MapWrapper::gemini_schema();
-        let map_schema = schema
-            .get("properties")
-            .and_then(|p| p.get("map"))
-            .expect("map schema should exist");
-
-        // HashMap schemas are transformed to arrays with __key__/__value__ items
-        assert_eq!(map_schema.get("type"), Some(&json!("array")));
-        assert!(map_schema.get("additionalProperties").is_none());
-
-        // Check the items schema
-        let items_schema = map_schema
-            .get("items")
-            .expect("items schema should exist");
-        assert_eq!(items_schema.get("type"), Some(&json!("object")));
-
-        let item_props = items_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("items should have properties");
-        assert!(item_props.contains_key("__key__"));
-        assert!(item_props.contains_key("__value__"));
-
-        // Check required fields
-        let required = items_schema
-            .get("required")
-            .and_then(|r| r.as_array())
-            .expect("items should have required");
-        assert!(required.contains(&json!("__key__")));
-        assert!(required.contains(&json!("__value__")));
-    }
-
-    #[test]
-    fn normalize_json_response_converts_kv_arrays_to_objects() {
-        let mut response = json!({
-            "map": [
-                { "__key__": "a", "__value__": "1" },
-                { "__key__": "b", "__value__": "2" }
-            ]
-        });
-
-        normalize_json_response(&mut response);
-
-        let map = response.get("map").expect("map should exist");
-        assert!(map.is_object());
-        assert_eq!(map.get("a"), Some(&json!("1")));
-        assert_eq!(map.get("b"), Some(&json!("2")));
-    }
-
-    #[test]
-    fn normalize_json_response_handles_nested_maps() {
-        let mut response = json!({
-            "outer": [
-                {
-                    "__key__": "x",
-                    "__value__": [
-                        { "__key__": "inner1", "__value__": 10 },
-                        { "__key__": "inner2", "__value__": 20 }
-                    ]
-                }
-            ]
-        });
-
-        normalize_json_response(&mut response);
-
-        let outer = response.get("outer").expect("outer should exist");
-        assert!(outer.is_object());
-        let x = outer.get("x").expect("x should exist");
-        assert!(x.is_object());
-        assert_eq!(x.get("inner1"), Some(&json!(10)));
-        assert_eq!(x.get("inner2"), Some(&json!(20)));
-    }
-
-    #[test]
-    fn normalize_json_response_leaves_regular_arrays_alone() {
-        let mut response = json!({
-            "items": [
-                { "id": 1, "name": "foo" },
-                { "id": 2, "name": "bar" }
-            ]
-        });
-
-        let expected = response.clone();
-        normalize_json_response(&mut response);
-
-        assert_eq!(response, expected);
-    }
-
-    #[derive(JsonSchema)]
-    struct Node {
-        value: String,
-        child: Option<Box<Node>>,
-    }
-
-    #[test]
-    fn recursive_schemas_inline_refs() {
-        let schema = Node::gemini_schema();
-        let schema_json = schema.to_string();
-
-        assert!(!schema_json.contains("\"$ref\""));
-        assert!(!schema_json.contains("\"components\""));
-    }
-
-    // Pure string enum - should be converted to { "type": "string", "enum": [...] }
-    #[derive(JsonSchema)]
-    enum AccountType {
-        Revenue,
-        CostOfSales,
-        Expense,
-        Asset,
-        Liability,
-    }
-
-    #[test]
-    fn pure_string_enum_converts_to_string_with_enum() {
-        let schema = AccountType::gemini_schema();
-
-        // Should be type: "string" with enum values
-        assert_eq!(schema.get("type"), Some(&json!("string")));
-
-        let enum_values = schema
-            .get("enum")
-            .and_then(|e| e.as_array())
-            .expect("enum should exist and be an array");
-
-        // All variants should be present
-        assert!(enum_values.contains(&json!("Revenue")));
-        assert!(enum_values.contains(&json!("CostOfSales")));
-        assert!(enum_values.contains(&json!("Expense")));
-        assert!(enum_values.contains(&json!("Asset")));
-        assert!(enum_values.contains(&json!("Liability")));
-
-        // Should NOT have object properties (the old broken behavior)
-        assert!(schema.get("properties").is_none());
-        assert!(schema.get("oneOf").is_none());
-        assert!(schema.get("anyOf").is_none());
-    }
-
-    // Mixed enum with both unit variants and struct variants
-    #[derive(JsonSchema)]
-    enum SeasonalityProfileId {
-        Flat,
-        Custom { values: Vec<f64> },
-    }
-
-    #[test]
-    fn mixed_enum_preserves_anyof() {
-        let schema = SeasonalityProfileId::gemini_schema();
-
-        // Should have anyOf preserved (not flattened)
-        let any_of = schema
-            .get("anyOf")
-            .and_then(|a| a.as_array())
-            .expect("anyOf should exist and be an array");
-
-        // Should have 2 variants
-        assert_eq!(any_of.len(), 2);
-
-        // Check that we have both string and object variants
-        let has_string_variant = any_of
-            .iter()
-            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("string"));
-        let has_object_variant = any_of
-            .iter()
-            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("object"));
-
-        assert!(has_string_variant, "Should have a string variant");
-        assert!(has_object_variant, "Should have an object variant");
-
-        // Parent should NOT have type (since it could be string or object)
-        assert!(schema.get("type").is_none());
-    }
-
-    // Complex object enum - should still flatten
-    #[derive(JsonSchema)]
-    enum Message {
-        Request { id: u32, payload: String },
-        Response { id: u32, result: String },
-    }
-
-    #[test]
-    fn complex_object_enum_flattens() {
-        let schema = Message::gemini_schema();
-
-        // Should be flattened to an object
-        assert_eq!(schema.get("type"), Some(&json!("object")));
-
-        // Schemars uses externally-tagged format by default:
-        // Each variant name becomes a property with its fields as nested object
-        let properties = schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("properties should exist");
-
-        // Variant names should be properties
-        assert!(properties.contains_key("Request"));
-        assert!(properties.contains_key("Response"));
-
-        // Each variant should have its nested properties
-        let request_props = properties
-            .get("Request")
-            .and_then(|r| r.get("properties"))
-            .and_then(|p| p.as_object())
-            .expect("Request properties should exist");
-        assert!(request_props.contains_key("id"));
-        assert!(request_props.contains_key("payload"));
-
-        // Should NOT have anyOf (should be flattened)
-        assert!(schema.get("anyOf").is_none());
-        assert!(schema.get("oneOf").is_none());
-    }
-
-    /// Test that allOf with description pattern is handled correctly.
-    /// schemars often generates: { "description": "...", "allOf": [{"$ref": "..."}] }
-    /// After ref inlining, the allOf contents should be merged into the parent.
-    #[test]
-    fn allof_with_description_merges_correctly() {
-        // Simulate the pattern schemars generates after ref inlining:
-        // { "description": "The processor to use", "allOf": [{ "type": "object", "properties": {...} }] }
+    fn clean_schema_strips_unsupported_keywords() {
         let mut schema = json!({
-            "description": "The processor configuration",
-            "allOf": [
-                {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Test",
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "default": "example",
+                    "examples": ["a"],
+                    "readOnly": true
+                }
+            },
+            "const": "noop"
+        });
+
+        clean_schema_for_gemini(&mut schema);
+
+        assert!(schema.get("$schema").is_none());
+        assert!(schema.get("title").is_none());
+        assert!(schema.get("const").is_none());
+
+        let name_schema = schema
+            .get("properties")
+            .and_then(|p| p.get("name"))
+            .expect("name schema should exist");
+        assert!(name_schema.get("default").is_none());
+        assert!(name_schema.get("examples").is_none());
+        assert!(name_schema.get("readOnly").is_none());
+    }
+
+    #[test]
+    fn clean_schema_keeps_defs_and_refs() {
+        let mut schema = json!({
+            "$defs": {
+                "Node": {
                     "type": "object",
                     "properties": {
-                        "model": {
-                            "type": "object",
-                            "properties": {
-                                "type": { "type": "string", "enum": ["mstl", "arima"] }
-                            },
-                            "required": ["type"]
-                        }
-                    },
-                    "required": ["model"]
+                        "child": { "$ref": "#/$defs/Node" }
+                    }
                 }
-            ]
+            },
+            "$ref": "#/$defs/Node"
         });
 
         clean_schema_for_gemini(&mut schema);
 
-        // The allOf should be removed
-        assert!(schema.get("allOf").is_none(), "allOf should be removed");
-
-        // The description from the parent should be preserved
-        assert_eq!(
-            schema.get("description"),
-            Some(&json!("The processor configuration")),
-            "description should be preserved"
-        );
-
-        // The type from the allOf sub-schema should be merged into the parent
-        assert_eq!(
-            schema.get("type"),
-            Some(&json!("object")),
-            "type should be merged from allOf"
-        );
-
-        // The properties should be merged into the parent
-        let properties = schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("properties should exist after merge");
-        assert!(
-            properties.contains_key("model"),
-            "model property should be merged from allOf"
-        );
-
-        // The required array should be merged into the parent
-        let required = schema
-            .get("required")
-            .and_then(|r| r.as_array())
-            .expect("required should exist after merge");
-        assert!(
-            required.contains(&json!("model")),
-            "model should be in required"
-        );
+        assert!(schema.get("$defs").is_some());
+        assert!(schema.get("$ref").is_some());
     }
 
-    /// Test that nested allOf structures are handled correctly
-    #[test]
-    fn nested_allof_structures_merge_correctly() {
-        // Parent has a description and allOf, where allOf sub-schema also has a description
-        let mut schema = json!({
-            "description": "Parent description",
-            "allOf": [
-                {
-                    "type": "object",
-                    "description": "Sub-schema description (should be ignored since parent has one)",
-                    "properties": {
-                        "name": { "type": "string" }
-                    },
-                    "required": ["name"]
-                }
-            ]
-        });
-
-        clean_schema_for_gemini(&mut schema);
-
-        // Parent description should win (since it already existed)
-        assert_eq!(
-            schema.get("description"),
-            Some(&json!("Parent description")),
-            "parent description should be preserved"
-        );
-
-        // Type and properties should be merged
-        assert_eq!(schema.get("type"), Some(&json!("object")));
-        assert!(schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .is_some_and(|p| p.contains_key("name")));
-    }
-
-    /// Test multiple sub-schemas in allOf are all merged
-    #[test]
-    fn multiple_allof_subschemas_merge_correctly() {
-        let mut schema = json!({
-            "allOf": [
-                {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "integer" }
-                    },
-                    "required": ["id"]
-                },
-                {
-                    "properties": {
-                        "name": { "type": "string" }
-                    },
-                    "required": ["name"]
-                }
-            ]
-        });
-
-        clean_schema_for_gemini(&mut schema);
-
-        assert!(schema.get("allOf").is_none());
-        assert_eq!(schema.get("type"), Some(&json!("object")));
-
-        let properties = schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("properties should exist");
-        assert!(properties.contains_key("id"), "id should be merged");
-        assert!(properties.contains_key("name"), "name should be merged");
-
-        let required = schema
-            .get("required")
-            .and_then(|r| r.as_array())
-            .expect("required should exist");
-        assert!(required.contains(&json!("id")), "id should be required");
-        assert!(required.contains(&json!("name")), "name should be required");
-    }
-
-    /// Test that array types are normalized to single types with nullable flag.
-    /// Gemini API requires type: "string", not type: ["string", "null"].
-    #[test]
-    fn array_type_normalized_to_single_with_nullable() {
-        // Standard JSON Schema nullable pattern
-        let mut schema = json!({
-            "type": ["integer", "null"],
-            "description": "An optional count"
-        });
-
-        clean_schema_for_gemini(&mut schema);
-
-        // Should be normalized to single type with nullable
-        assert_eq!(
-            schema.get("type"),
-            Some(&json!("integer")),
-            "type should be a single string, not an array"
-        );
-        assert_eq!(
-            schema.get("nullable"),
-            Some(&json!(true)),
-            "nullable should be true"
-        );
-        assert_eq!(
-            schema.get("description"),
-            Some(&json!("An optional count")),
-            "description should be preserved"
-        );
-    }
-
-    /// Test array type without null is normalized to single type
-    #[test]
-    fn array_type_single_element_normalized() {
-        let mut schema = json!({
-            "type": ["string"]
-        });
-
-        clean_schema_for_gemini(&mut schema);
-
-        assert_eq!(schema.get("type"), Some(&json!("string")));
-        assert!(schema.get("nullable").is_none());
-    }
-
-    /// Test that allOf with array types are properly handled
-    #[test]
-    fn allof_with_array_type_normalized() {
-        // Simulate allOf sub-schema having array type (from standard JSON Schema)
-        let mut schema = json!({
-            "description": "A nullable field",
-            "allOf": [
-                {
-                    "type": ["integer", "null"],
-                    "minimum": 0
-                }
-            ]
-        });
-
-        clean_schema_for_gemini(&mut schema);
-
-        // allOf should be removed
-        assert!(schema.get("allOf").is_none());
-
-        // Type should be normalized
-        assert_eq!(schema.get("type"), Some(&json!("integer")));
-        assert_eq!(schema.get("nullable"), Some(&json!(true)));
-        assert_eq!(schema.get("description"), Some(&json!("A nullable field")));
-    }
-
-    /// Test that internally-tagged enums collapsed to strings are recovered
     #[test]
     fn recover_internally_tagged_enum_from_string() {
-        // Schema for an internally-tagged enum with "type" discriminator
         let schema = json!({
-            "type": "object",
-            "properties": {
-                "processor": {
-                    "anyOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "type": { "const": "mstl" }
-                            },
-                            "required": ["type"]
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "type": { "const": "arima" }
-                            },
-                            "required": ["type"]
-                        }
-                    ]
-                }
-            }
-        });
-
-        // Gemini collapsed the object to just the string value
-        let mut value = json!({
-            "processor": "mstl"
-        });
-
-        recover_internally_tagged_enums(&mut value, &schema);
-
-        // Should be expanded back to object form
-        assert_eq!(
-            value.get("processor"),
-            Some(&json!({"type": "mstl"})),
-            "String should be recovered to object with tag field"
-        );
-    }
-
-    /// Test that recovery works in nested structures (arrays)
-    #[test]
-    fn recover_internally_tagged_enum_in_array() {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "anyOf": [
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "kind": { "const": "foo" }
-                                },
-                                "required": ["kind"]
-                            },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "kind": { "const": "bar" }
-                                },
-                                "required": ["kind"]
-                            }
-                        ]
-                    }
-                }
-            }
-        });
-
-        let mut value = json!({
-            "items": ["foo", "bar", "foo"]
-        });
-
-        recover_internally_tagged_enums(&mut value, &schema);
-
-        // All array items should be recovered
-        let items = value.get("items").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(items[0], json!({"kind": "foo"}));
-        assert_eq!(items[1], json!({"kind": "bar"}));
-        assert_eq!(items[2], json!({"kind": "foo"}));
-    }
-
-    /// Test that recovery doesn't affect non-collapsed values
-    #[test]
-    fn recover_leaves_valid_objects_unchanged() {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "processor": {
-                    "anyOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "type": { "const": "mstl" }
-                            },
-                            "required": ["type"]
-                        }
-                    ]
-                }
-            }
-        });
-
-        // Already in correct object form
-        let mut value = json!({
-            "processor": {"type": "mstl"}
-        });
-
-        let original = value.clone();
-        recover_internally_tagged_enums(&mut value, &schema);
-
-        // Should remain unchanged
-        assert_eq!(value, original);
-    }
-
-    /// Test recovery in normalized HashMaps (where data is Object but schema is Array)
-    #[test]
-    fn recover_internally_tagged_enum_in_normalized_hashmap() {
-        // Schema for a HashMap where values contain internally-tagged enums
-        // This mimics the Gemini transformation: HashMap -> Array with {__key__, __value__}
-        // Note: After Gemini schema cleaning, anyOf is often flattened, but we still need
-        // to handle the case where it remains for complex enums
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "config": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "__key__": { "type": "string" },
-                            "__value__": {
-                                "anyOf": [
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "kind": { "const": "alpha" }
-                                        },
-                                        "required": ["kind"]
-                                    },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "kind": { "const": "beta" }
-                                        },
-                                        "required": ["kind"]
-                                    }
-                                ]
-                            }
-                        },
-                        "required": ["__key__", "__value__"]
-                    }
-                }
-            }
-        });
-
-        // This represents the data AFTER normalize_json_response has run
-        // (converting the KV-Array back to an Object)
-        let mut value = json!({
-            "config": {
-                "item1": "alpha",  // Collapsed enum (entire object collapsed to string)
-                "item2": "beta"
-            }
-        });
-
-        recover_internally_tagged_enums(&mut value, &schema);
-
-        // The nested enums should be recovered even though the HashMap is normalized
-        assert_eq!(
-            value.get("config").and_then(|o| o.get("item1")),
-            Some(&json!({"kind": "alpha"})),
-            "Nested enum in normalized HashMap should be recovered"
-        );
-
-        assert_eq!(
-            value.get("config").and_then(|o| o.get("item2")),
-            Some(&json!({"kind": "beta"})),
-            "All values in normalized HashMap should be processed"
-        );
-    }
-
-    /// Test recovery with enum (single-element array) instead of const
-    #[test]
-    fn recover_with_enum_schema() {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "mode": {
-                    "anyOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "variant": { "enum": ["alpha"] }
-                            },
-                            "required": ["variant"]
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "variant": { "enum": ["beta"] }
-                            },
-                            "required": ["variant"]
-                        }
-                    ]
-                }
-            }
-        });
-
-        let mut value = json!({
-            "mode": "alpha"
-        });
-
-        recover_internally_tagged_enums(&mut value, &schema);
-
-        assert_eq!(
-            value.get("mode"),
-            Some(&json!({"variant": "alpha"})),
-            "String should be recovered using enum schema"
-        );
-    }
-
-    /// Test that allOf containing oneOf (enum with description) is properly merged.
-    /// This is the pattern schemars generates when a field has a description and is an enum type.
-    /// Example: { "description": "The processor to use", "allOf": [{ "oneOf": [...] }] }
-    #[test]
-    fn allof_containing_oneof_merges_correctly() {
-        // Simulate the pattern: a processor field that's an enum, wrapped in allOf with description
-        let mut schema = json!({
-            "description": "The processor to use",
-            "allOf": [
+            "anyOf": [
                 {
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "model": {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": { "type": "string", "enum": ["mstl", "arima"] }
-                                    },
-                                    "required": ["type"]
-                                }
-                            },
-                            "required": ["model"]
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "custom": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string" }
-                                    },
-                                    "required": ["name"]
-                                }
-                            },
-                            "required": ["custom"]
-                        }
-                    ]
-                }
-            ]
-        });
-
-        clean_schema_for_gemini(&mut schema);
-
-        // allOf should be removed
-        assert!(
-            schema.get("allOf").is_none(),
-            "allOf should be removed after merge"
-        );
-
-        // Description should be preserved
-        assert_eq!(
-            schema.get("description"),
-            Some(&json!("The processor to use")),
-            "description should be preserved"
-        );
-
-        // The schema should NOT be empty - it should have type and properties from flattened oneOf
-        // After oneOf flattening for object variants, we should have type: "object" and properties
-        assert!(
-            schema.get("type").is_some() || schema.get("properties").is_some(),
-            "schema should have type or properties after oneOf merge, got: {}",
-            serde_json::to_string_pretty(&schema).unwrap()
-        );
-
-        // Should have properties (flattened from oneOf variants)
-        let properties = schema.get("properties").and_then(|p| p.as_object());
-        assert!(
-            properties.is_some(),
-            "should have properties after flattening oneOf, got: {}",
-            serde_json::to_string_pretty(&schema).unwrap()
-        );
-
-        let props = properties.unwrap();
-        assert!(
-            props.contains_key("model") || props.contains_key("custom"),
-            "should have model or custom property, got: {:?}",
-            props.keys().collect::<Vec<_>>()
-        );
-    }
-
-    /// Test allOf containing a pure string enum (oneOf with const values)
-    #[test]
-    fn allof_containing_string_enum_merges_correctly() {
-        let mut schema = json!({
-            "description": "The account type",
-            "allOf": [
-                {
-                    "oneOf": [
-                        { "type": "string", "const": "Revenue" },
-                        { "type": "string", "const": "Expense" },
-                        { "type": "string", "const": "Asset" }
-                    ]
-                }
-            ]
-        });
-
-        clean_schema_for_gemini(&mut schema);
-
-        // allOf should be removed
-        assert!(schema.get("allOf").is_none());
-
-        // Description should be preserved
-        assert_eq!(
-            schema.get("description"),
-            Some(&json!("The account type"))
-        );
-
-        // Should be converted to string enum
-        assert_eq!(
-            schema.get("type"),
-            Some(&json!("string")),
-            "should be string type"
-        );
-
-        let enum_values = schema
-            .get("enum")
-            .and_then(|e| e.as_array())
-            .expect("should have enum values");
-
-        assert!(enum_values.contains(&json!("Revenue")));
-        assert!(enum_values.contains(&json!("Expense")));
-        assert!(enum_values.contains(&json!("Asset")));
-    }
-
-    /// Test that a nested property with allOf + oneOf is properly handled
-    /// This simulates the real-world case where a `processor` field inside a config struct
-    /// has an enum type with a description.
-    #[test]
-    fn nested_property_with_allof_oneof_merges_correctly() {
-        let mut schema = json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string" },
-                "processor": {
-                    "description": "The processor to use",
-                    "allOf": [
-                        {
-                            "oneOf": [
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "model": {
-                                            "type": "object",
-                                            "properties": {
-                                                "type": { "type": "string", "enum": ["mstl"] }
-                                            },
-                                            "required": ["type"]
-                                        }
-                                    },
-                                    "required": ["model"]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            },
-            "required": ["name", "processor"]
-        });
-
-        clean_schema_for_gemini(&mut schema);
-
-        // Get the processor property
-        let processor = schema
-            .get("properties")
-            .and_then(|p| p.get("processor"))
-            .expect("processor property should exist");
-
-        // allOf should be removed from processor
-        assert!(
-            processor.get("allOf").is_none(),
-            "allOf should be removed from processor"
-        );
-
-        // Description should be preserved
-        assert_eq!(
-            processor.get("description"),
-            Some(&json!("The processor to use")),
-            "description should be preserved"
-        );
-
-        // Processor should NOT be empty - it should have the flattened structure
-        assert!(
-            processor.get("type").is_some() || processor.get("properties").is_some(),
-            "processor should have type or properties, got: {}",
-            serde_json::to_string_pretty(processor).unwrap()
-        );
-    }
-
-    /// Test the complete flow: $ref inlining followed by allOf merging.
-    /// This simulates how schemars generates schemas with references.
-    #[test]
-    fn ref_inlining_then_allof_merge_works() {
-        // This is how schemars generates the schema:
-        // - The processor field has { description: "...", allOf: [{ $ref: "#/$defs/ProcessorType" }] }
-        // - ProcessorType is defined in $defs with a oneOf
-        let mut schema = json!({
-            "type": "object",
-            "properties": {
-                "processor": {
-                    "description": "The processor to use",
-                    "allOf": [
-                        { "$ref": "#/$defs/ProcessorType" }
-                    ]
-                }
-            },
-            "$defs": {
-                "ProcessorType": {
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "model": {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": { "type": "string", "enum": ["mstl"] }
-                                    }
-                                }
-                            }
-                        }
-                    ]
-                }
-            }
-        });
-
-        // This is the same function called by gemini_schema()
-        clean_schema_for_gemini(&mut schema);
-
-        // $defs should be removed
-        assert!(schema.get("$defs").is_none(), "$defs should be removed");
-
-        // Get the processor property
-        let processor = schema
-            .get("properties")
-            .and_then(|p| p.get("processor"))
-            .expect("processor property should exist");
-
-        // $ref should be inlined and allOf should be merged
-        assert!(processor.get("$ref").is_none(), "$ref should be removed");
-        assert!(processor.get("allOf").is_none(), "allOf should be removed");
-
-        // Description should be preserved
-        assert_eq!(
-            processor.get("description"),
-            Some(&json!("The processor to use"))
-        );
-
-        // The oneOf should be processed and flattened
-        assert!(
-            processor.get("type").is_some() || processor.get("properties").is_some(),
-            "processor should have content after processing, got: {}",
-            serde_json::to_string_pretty(processor).unwrap()
-        );
-    }
-
-    /// Test that oneOf variants wrapped in allOf are properly cleaned before flattening.
-    /// This is the key fix: schemars may wrap each variant in allOf to add descriptions,
-    /// hiding the properties from the flattening logic.
-    #[test]
-    fn oneof_variants_with_allof_wrappers_cleaned_before_flatten() {
-        // This simulates schemars output where each variant in a oneOf is wrapped in allOf
-        // to attach a description to each variant.
-        let mut schema = json!({
-            "oneOf": [
-                {
-                    "description": "Model-based processor",
-                    "allOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "model": {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": { "type": "string", "enum": ["mstl"] }
-                                    },
-                                    "required": ["type"]
-                                }
-                            },
-                            "required": ["model"]
-                        }
-                    ]
+                    "type": "object",
+                    "properties": {"type": {"const": "auto"}},
+                    "required": ["type"]
                 },
                 {
-                    "description": "Custom processor",
-                    "allOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "custom": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": { "type": "string" }
-                                    },
-                                    "required": ["name"]
-                                }
-                            },
-                            "required": ["custom"]
-                        }
-                    ]
+                    "type": "object",
+                    "properties": {"type": {"const": "manual"}, "threshold": {"type": "number"}},
+                    "required": ["type", "threshold"]
                 }
             ]
         });
 
-        clean_schema_for_gemini(&mut schema);
+        let mut value = json!("auto");
+        recover_internally_tagged_enums(&mut value, &schema);
 
-        // Should be flattened to an object with both variant properties
-        assert_eq!(
-            schema.get("type"),
-            Some(&json!("object")),
-            "should be flattened to object type"
-        );
-
-        let properties = schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("should have properties after flattening");
-
-        // Both variants' properties should be present
-        assert!(
-            properties.contains_key("model"),
-            "should have 'model' property from first variant"
-        );
-        assert!(
-            properties.contains_key("custom"),
-            "should have 'custom' property from second variant"
-        );
-
-        // allOf should be completely removed
-        assert!(schema.get("allOf").is_none());
-        assert!(schema.get("oneOf").is_none());
+        assert_eq!(value, json!({"type": "auto"}));
     }
 
-    /// Test deeply nested allOf inside oneOf variants
     #[test]
-    fn deeply_nested_allof_in_oneof_variants() {
-        let mut schema = json!({
-            "type": "object",
-            "properties": {
-                "processor": {
-                    "description": "The processor configuration",
-                    "allOf": [
-                        {
-                            "oneOf": [
-                                {
-                                    "description": "MSTL variant",
-                                    "allOf": [
-                                        {
-                                            "type": "object",
-                                            "properties": {
-                                                "model": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "type": { "type": "string", "const": "mstl" }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
+    fn prune_null_fields_removes_nulls() {
+        let mut value = json!({
+            "name": "John",
+            "age": null,
+            "nested": {"field": null, "ok": "yes"}
         });
 
-        clean_schema_for_gemini(&mut schema);
+        prune_null_fields(&mut value);
 
-        let processor = schema
-            .get("properties")
-            .and_then(|p| p.get("processor"))
-            .expect("processor should exist");
-
-        // All allOf should be merged
-        assert!(processor.get("allOf").is_none(), "allOf should be removed");
-
-        // Description from outer allOf should be preserved
         assert_eq!(
-            processor.get("description"),
-            Some(&json!("The processor configuration"))
+            value,
+            json!({
+                "name": "John",
+                "nested": {"ok": "yes"}
+            })
         );
+    }
 
-        // Should have the flattened structure
-        assert!(
-            processor.get("type").is_some() || processor.get("properties").is_some(),
-            "processor should have content, got: {}",
-            serde_json::to_string_pretty(processor).unwrap()
-        );
+    #[test]
+    fn gemini_schema_builds() {
+        let schema = Contact::gemini_schema();
+        assert!(schema.get("properties").is_some());
     }
 }

@@ -5,7 +5,7 @@ use gemini_rust::{
     Gemini, GenerationConfig, Message, Model, Role, SafetySetting, Tool,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     caching::{CachePolicy, CacheSettings, SchemaCache},
@@ -17,7 +17,9 @@ use crate::{
         ArrayPatchStrategy, PatchStrategy, RefinementConfig, RefinementEngine, RefinementRequest,
         ValidationFailureStrategy,
     },
-    schema::{clean_schema_for_gemini, GeminiStructured, StructuredValidator},
+    schema::{
+        clean_schema_for_gemini, GeminiStructured, StructuredValidator, STRICT_SCHEMA_DEPTH_LIMIT,
+    },
     tools::ToolRegistry,
     StructuredRequest,
 };
@@ -68,6 +70,7 @@ pub(crate) struct BuilderOptions<'a> {
     pub cache_settings: &'a Option<CacheSettings>,
     pub system_instruction: &'a Option<String>,
     pub safety_settings: &'a Option<Vec<SafetySetting>>,
+    pub force_prompt_schema: bool,
 }
 
 /// Global configuration options for the client.
@@ -529,8 +532,50 @@ impl StructuredClient {
         clean_schema_for_gemini(&mut cleaned_schema);
         // Strip x-* fields before sending to Gemini (they're for internal use only)
         crate::schema::strip_x_fields(&mut cleaned_schema);
+        crate::schema::warn_if_schema_too_deep(&cleaned_schema, STRICT_SCHEMA_DEPTH_LIMIT);
+        let schema_depth = crate::schema::schema_depth(&cleaned_schema);
+        let schema_bytes = serde_json::to_string(&cleaned_schema)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let defs_count = cleaned_schema
+            .get("$defs")
+            .and_then(|v| v.as_object())
+            .map(|o| o.len())
+            .unwrap_or(0);
+        let root_props = cleaned_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .map(|o| o.len())
+            .unwrap_or(0);
+        debug!(
+            schema.depth = schema_depth,
+            schema.bytes = schema_bytes,
+            schema.defs.count = defs_count,
+            schema.root.properties = root_props,
+            "Prepared dynamic response schema"
+        );
+        let use_prompt_schema = schema_depth >= STRICT_SCHEMA_DEPTH_LIMIT;
         let mut generation_config = generation_config.unwrap_or_default();
-        generation_config.response_schema = Some(cleaned_schema);
+        let mut final_system_instruction = system_instruction.clone();
+        if use_prompt_schema {
+            warn!(
+                schema.depth = schema_depth,
+                "Schema depth exceeds strict-mode limit; falling back to prompt-embedded schema"
+            );
+            let schema_instruction = format!(
+                "You must output valid JSON matching this schema exactly:\n{}",
+                serde_json::to_string_pretty(&cleaned_schema).unwrap_or_default()
+            );
+            final_system_instruction = Some(match final_system_instruction {
+                Some(existing) => format!("{}\n\n{}", existing, schema_instruction),
+                None => schema_instruction,
+            });
+            generation_config.response_json_schema = None;
+            generation_config.response_schema = None;
+        } else {
+            generation_config.response_json_schema = Some(cleaned_schema);
+            generation_config.response_schema = None;
+        }
         generation_config
             .response_mime_type
             .get_or_insert_with(|| "application/json".to_string());
@@ -542,7 +587,7 @@ impl StructuredClient {
         for msg in messages {
             builder = builder.with_message(msg);
         }
-        if let Some(system) = system_instruction {
+        if let Some(system) = final_system_instruction {
             builder = builder.with_system_instruction(system);
         }
 
@@ -601,6 +646,7 @@ impl StructuredClient {
                     cache_settings: &cache_settings,
                     system_instruction: &system_instruction,
                     safety_settings: &None,
+                    force_prompt_schema: false,
                 },
             )
             .await?;
@@ -654,12 +700,13 @@ impl StructuredClient {
             cache_settings,
             system_instruction,
             safety_settings,
+            force_prompt_schema,
         } = opts;
         let schema = T::gemini_schema();
 
-        // Create a clean copy of the schema for Gemini (without x-* fields)
-        // The original schema with x-* fields will be used for unflattening
+        // Create a clean copy of the schema for Gemini (without x-* fields).
         let mut gemini_schema = schema.clone();
+        crate::schema::clean_schema_for_gemini(&mut gemini_schema);
         crate::schema::strip_x_fields(&mut gemini_schema);
 
         let mut config = config.clone();
@@ -673,18 +720,43 @@ impl StructuredClient {
         let schema_json = serde_json::to_string_pretty(&gemini_schema)
             .unwrap_or_else(|_| "Unable to serialize schema".to_string());
 
+        crate::schema::warn_if_schema_too_deep(&gemini_schema, STRICT_SCHEMA_DEPTH_LIMIT);
+        let schema_depth = crate::schema::schema_depth(&gemini_schema);
+        let schema_bytes = serde_json::to_string(&gemini_schema)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let defs_count = gemini_schema
+            .get("$defs")
+            .and_then(|v| v.as_object())
+            .map(|o| o.len())
+            .unwrap_or(0);
+        let root_props = gemini_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .map(|o| o.len())
+            .unwrap_or(0);
+        debug!(
+            schema.depth = schema_depth,
+            schema.bytes = schema_bytes,
+            schema.defs.count = defs_count,
+            schema.root.properties = root_props,
+            "Prepared response schema"
+        );
+        let use_prompt_schema = force_prompt_schema || schema_depth >= STRICT_SCHEMA_DEPTH_LIMIT;
         if has_tools {
-            if is_gemini_3 {
+            if is_gemini_3 && !use_prompt_schema {
                 // Gemini 3: enable strict JSON outputs alongside tools.
                 debug!("Gemini 3 detected: enforcing JSON schema with tools enabled");
-                config.response_schema = Some(gemini_schema);
+                config.response_json_schema = Some(gemini_schema);
+                config.response_schema = None;
                 config
                     .response_mime_type
                     .get_or_insert_with(|| "application/json".to_string());
             } else {
                 // Legacy models: inject schema into system prompt instead of forcing mime/schema in config.
-                debug!("Legacy model with tools: injecting schema into system prompt");
+                debug!("Embedding schema into system prompt (tools enabled or depth fallback)");
                 info!("Embedding schema into system prompt (tools enabled legacy path):\n{schema_json}");
+                config.response_json_schema = None;
                 config.response_schema = None;
                 config.response_mime_type = None;
 
@@ -699,7 +771,25 @@ impl StructuredClient {
                 });
             }
         } else {
-            config.response_schema = Some(gemini_schema);
+            if use_prompt_schema {
+                warn!(
+                    schema.depth = schema_depth,
+                    "Schema depth exceeds strict-mode limit; falling back to prompt-embedded schema"
+                );
+                let schema_instruction = format!(
+                    "You must output valid JSON matching this schema exactly:\n{}",
+                    serde_json::to_string_pretty(&gemini_schema).unwrap_or_default()
+                );
+                final_system_instruction = Some(match final_system_instruction {
+                    Some(existing) => format!("{}\n\n{}", existing, schema_instruction),
+                    None => schema_instruction,
+                });
+                config.response_json_schema = None;
+                config.response_schema = None;
+            } else {
+                config.response_json_schema = Some(gemini_schema);
+                config.response_schema = None;
+            }
             config
                 .response_mime_type
                 .get_or_insert_with(|| "application/json".to_string());
