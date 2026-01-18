@@ -86,6 +86,8 @@ pub struct ClientConfig {
     pub default_tool_steps: usize,
     /// Array patching strategy for refinement (default: ReplaceWhole)
     pub array_strategy: ArrayPatchStrategy,
+    /// Strategy for enum-keyed map schemas (default: Preserve)
+    pub map_schema_mode: crate::schema::MapSchemaMode,
 }
 
 impl Default for ClientConfig {
@@ -96,6 +98,7 @@ impl Default for ClientConfig {
             default_parse_attempts: 3,
             default_tool_steps: 5,
             array_strategy: ArrayPatchStrategy::ReplaceWhole,
+            map_schema_mode: crate::schema::MapSchemaMode::Preserve,
         }
     }
 }
@@ -219,6 +222,12 @@ impl StructuredClientBuilder {
     /// Set the array patching strategy for refinement.
     pub fn with_array_strategy(mut self, strategy: ArrayPatchStrategy) -> Self {
         self.config.array_strategy = strategy.clone();
+        self
+    }
+
+    /// Set the schema mode for enum-keyed maps.
+    pub fn with_map_schema_mode(mut self, mode: crate::schema::MapSchemaMode) -> Self {
+        self.config.map_schema_mode = mode;
         self
     }
 
@@ -530,6 +539,10 @@ impl StructuredClient {
 
         let mut cleaned_schema = json_schema;
         clean_schema_for_gemini(&mut cleaned_schema);
+        crate::schema::apply_map_schema_mode(
+            &mut cleaned_schema,
+            self.config.map_schema_mode.clone(),
+        );
         // Strip x-* fields before sending to Gemini (they're for internal use only)
         crate::schema::strip_x_fields(&mut cleaned_schema);
         crate::schema::warn_if_schema_too_deep(&cleaned_schema, STRICT_SCHEMA_DEPTH_LIMIT);
@@ -707,6 +720,10 @@ impl StructuredClient {
         // Create a clean copy of the schema for Gemini (without x-* fields).
         let mut gemini_schema = schema.clone();
         crate::schema::clean_schema_for_gemini(&mut gemini_schema);
+        crate::schema::apply_map_schema_mode(
+            &mut gemini_schema,
+            self.config.map_schema_mode.clone(),
+        );
         crate::schema::strip_x_fields(&mut gemini_schema);
 
         let mut config = config.clone();

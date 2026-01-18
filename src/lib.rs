@@ -74,7 +74,7 @@ pub use patching::{
     RefinementConfig, RefinementEngine, RefinementRequest, ValidationFailureStrategy,
 };
 pub use request::{StreamEvent, StructuredRequest};
-pub use schema::{GeminiStructured, GeminiValidator, StructuredValidator};
+pub use schema::{GeminiStructured, GeminiValidator, MapSchemaMode, StructuredValidator};
 pub use session::{ChangeEffect, EntryKind, InteractiveSession, PendingChange, SessionEntry};
 pub use tools::ToolRegistry;
 pub use workflow::{
@@ -108,7 +108,7 @@ pub mod prelude {
         RefinementConfig, RefinementEngine, RefinementRequest, ValidationFailureStrategy,
     };
     pub use crate::request::{StreamEvent, StructuredRequest};
-    pub use crate::schema::{GeminiStructured, GeminiValidator, StructuredValidator};
+    pub use crate::schema::{GeminiStructured, GeminiValidator, MapSchemaMode, StructuredValidator};
     pub use crate::session::{
         ChangeEffect, EntryKind, InteractiveSession, PendingChange, SessionEntry,
     };

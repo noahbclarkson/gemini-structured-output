@@ -1,5 +1,6 @@
 use gemini_rust::{Gemini, GenerationConfig, Model};
-use serde_json::{json, Map, Value};
+use gemini_structured_output::schema::{apply_map_schema_mode, MapSchemaMode};
+use serde_json::{json, Value};
 use std::env;
 
 #[tokio::test]
@@ -86,7 +87,8 @@ async fn probe_enum_map_schema_transform() {
         }
     });
 
-    let transformed_schema = transform_enum_maps_to_additional_properties(&original_schema);
+    let mut transformed_schema = original_schema.clone();
+    apply_map_schema_mode(&mut transformed_schema, MapSchemaMode::AdditionalProperties);
 
     let prompt = r#"
 Create a deployment config for "MyApp" with EXACTLY 2 regional configurations.
@@ -142,48 +144,6 @@ Do not omit any regions. Both us-east-1 and eu-west-1 must appear in regional_co
             Err(e) => println!("Request failed: {:?}", e),
         }
     }
-}
-
-fn transform_enum_maps_to_additional_properties(schema: &Value) -> Value {
-    let mut out = schema.clone();
-
-    if let Some(regional) = out
-        .pointer_mut("/properties/regional_configs")
-        .and_then(Value::as_object_mut)
-    {
-        collapse_properties_to_additional_properties(regional);
-    }
-
-    if let Some(inner) = out
-        .pointer_mut("/properties/failover_matrix/additionalProperties")
-        .and_then(Value::as_object_mut)
-    {
-        collapse_properties_to_additional_properties(inner);
-    }
-
-    out
-}
-
-fn collapse_properties_to_additional_properties(obj: &mut Map<String, Value>) -> bool {
-    let props = match obj.get("properties").and_then(|v| v.as_object()) {
-        Some(props) => props,
-        None => return false,
-    };
-
-    let mut values = props.values();
-    let first = match values.next() {
-        Some(value) => value.clone(),
-        None => return false,
-    };
-
-    if values.any(|value| value != &first) {
-        return false;
-    }
-
-    obj.insert("type".to_string(), Value::String("object".to_string()));
-    obj.insert("additionalProperties".to_string(), first);
-    obj.remove("properties");
-    true
 }
 
 fn validate_schema(schema: &Value, value: &Value) -> Result<(), String> {

@@ -16,7 +16,7 @@ evals = []
 macros = ["dep:gemini-structured-macros"]
 
 [dependencies]
-gemini-rust = { path = "../gemini-rust" }
+gemini-rust = { git = "https://github.com/noahbclarkson/gemini-rust", branch = "add-json-response-schema" }
 gemini-structured-macros = { path = "./gemini-structured-macros", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
