@@ -141,28 +141,52 @@ pub fn strip_x_fields(value: &mut Value) {
     }
 }
 
-/// Returns the max nesting depth of a schema.
+/// Returns the max logical nesting depth of the data structure described by the schema.
+/// This ignores JSON Schema syntax nesting and counts actual data layers.
 pub fn schema_depth(value: &Value) -> usize {
-    fn walk(value: &Value, depth: usize, max: &mut usize) {
-        *max = (*max).max(depth);
+    fn walk(value: &Value, current_depth: usize) -> usize {
         match value {
             Value::Object(map) => {
-                for v in map.values() {
-                    walk(v, depth + 1, max);
+                let mut max_child_depth = current_depth;
+
+                if let Some(props) = map.get("properties").and_then(|v| v.as_object()) {
+                    for sub_schema in props.values() {
+                        max_child_depth =
+                            max_child_depth.max(walk(sub_schema, current_depth + 1));
+                    }
                 }
-            }
-            Value::Array(arr) => {
-                for v in arr {
-                    walk(v, depth + 1, max);
+
+                if let Some(items) = map.get("items") {
+                    max_child_depth = max_child_depth.max(walk(items, current_depth + 1));
                 }
+
+                if let Some(add_props) = map.get("additionalProperties") {
+                    if add_props.is_object() {
+                        max_child_depth = max_child_depth.max(walk(add_props, current_depth + 1));
+                    }
+                }
+
+                for key in ["anyOf", "oneOf"] {
+                    if let Some(variants) = map.get(key).and_then(|v| v.as_array()) {
+                        for variant in variants {
+                            max_child_depth = max_child_depth.max(walk(variant, current_depth));
+                        }
+                    }
+                }
+
+                if let Some(defs) = map.get("$defs").and_then(|v| v.as_object()) {
+                    for def in defs.values() {
+                        max_child_depth = max_child_depth.max(walk(def, 1));
+                    }
+                }
+
+                max_child_depth
             }
-            _ => {}
+            _ => current_depth,
         }
     }
 
-    let mut max = 0;
-    walk(value, 1, &mut max);
-    max
+    walk(value, 0)
 }
 
 /// Emit a warning if a schema exceeds the suggested nesting depth.
@@ -174,8 +198,8 @@ pub fn warn_if_schema_too_deep(schema: &Value, max_depth: usize) {
 }
 
 /// Conservative nesting depth threshold for Gemini strict schema mode.
-/// Updated based on stress testing Gemini 3 Flash which fails at depth 5.
-pub const STRICT_SCHEMA_DEPTH_LIMIT: usize = 4;
+/// Updated based on logical depth calculation.
+pub const STRICT_SCHEMA_DEPTH_LIMIT: usize = 5;
 
 /// Recursively remove object keys where the value is null.
 pub fn prune_null_fields(value: &mut Value) {
