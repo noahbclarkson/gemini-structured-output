@@ -36,7 +36,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-xero-forecasting = { path = "../xero-forecasting" }
+xero-forecasting = { path = "../AI Forecaster/xero-forecasting" }
 
 
 [[example]]
@@ -118,4 +118,9 @@ path = "examples/dynamic_schema.rs"
 [[example]]
 name = "observability"
 path = "examples/observability.rs"
+required-features = ["macros"]
+
+[[test]]
+name = "stress_tool_pipeline"
+path = "tests/stress_tool_pipeline.rs"
 required-features = ["macros"]

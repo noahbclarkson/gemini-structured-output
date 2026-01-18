@@ -174,7 +174,8 @@ pub fn warn_if_schema_too_deep(schema: &Value, max_depth: usize) {
 }
 
 /// Conservative nesting depth threshold for Gemini strict schema mode.
-pub const STRICT_SCHEMA_DEPTH_LIMIT: usize = 12;
+/// Updated based on stress testing Gemini 3 Flash which fails at depth 5.
+pub const STRICT_SCHEMA_DEPTH_LIMIT: usize = 4;
 
 /// Recursively remove object keys where the value is null.
 pub fn prune_null_fields(value: &mut Value) {
@@ -418,12 +419,11 @@ fn coerce_string_enum_value(input: &str, schema: &Value) -> Option<Value> {
         if prefix_len >= 3 {
             let dist = levenshtein(&input_norm, &cand_norm);
             let max_len = input_norm.len().max(cand_norm.len());
-            let threshold = (max_len / 2).max(2).min(8);
-            if dist <= threshold {
-                if best.as_ref().map_or(true, |(best_dist, _)| dist < *best_dist) {
+            let threshold = (max_len / 2).clamp(2, 8);
+            if dist <= threshold
+                && best.as_ref().is_none_or(|(best_dist, _)| dist < *best_dist) {
                     best = Some((dist, candidate));
                 }
-            }
         }
     }
 
@@ -537,7 +537,7 @@ fn select_variant_for_object<'a>(
         variant
             .get("properties")
             .and_then(|p| p.as_object())
-            .map_or(false, |props| keys.iter().all(|key| props.contains_key(*key)))
+            .is_some_and(|props| keys.iter().all(|key| props.contains_key(*key)))
     })
 }
 
@@ -617,6 +617,7 @@ mod tests {
 
     #[derive(JsonSchema)]
     struct Contact {
+        #[allow(dead_code)]
         phone: Option<String>,
     }
 

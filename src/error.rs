@@ -146,17 +146,18 @@ impl StructuredError {
 }
 
 /// Parse retry delay from Gemini API error response body.
-/// Looks for `"retryDelay": "44s"` or similar patterns.
 fn parse_retry_delay_from_error(description: &str) -> Option<u64> {
-    // Try to parse as JSON and find retryDelay in details
+    // 1. Try strict JSON parsing first (most reliable)
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(description) {
         if let Some(details) = json.get("error").and_then(|e| e.get("details")) {
             if let Some(arr) = details.as_array() {
                 for detail in arr {
+                    // Check for RetryInfo type
                     if detail.get("@type").and_then(|t| t.as_str())
                         == Some("type.googleapis.com/google.rpc.RetryInfo")
                     {
-                        if let Some(delay_str) = detail.get("retryDelay").and_then(|d| d.as_str()) {
+                        if let Some(delay_str) = detail.get("retryDelay").and_then(|d| d.as_str())
+                        {
                             return parse_duration_string(delay_str);
                         }
                     }
@@ -165,29 +166,48 @@ fn parse_retry_delay_from_error(description: &str) -> Option<u64> {
         }
     }
 
-    // Fallback: regex-like pattern match for "retry in X.Xs" or "retryDelay": "Xs"
+    // 2. Fallback: Heuristic text search
+    // Handles: "Please retry in 57s.", "retry in 488.04ms"
     let lower = description.to_lowercase();
     if let Some(idx) = lower.find("retry in ") {
         let start = idx + "retry in ".len();
-        if let Some(end) = lower[start..].find('s') {
-            if let Ok(secs) = lower[start..start + end].trim().parse::<f64>() {
-                return Some(secs.ceil() as u64);
-            }
-        }
+        // extract the word after "retry in "
+        let remainder = &lower[start..];
+        let end = remainder
+            .find(|c: char| !c.is_numeric() && c != '.' && c != 'm' && c != 's')
+            .unwrap_or(remainder.len());
+
+        let duration_str = &remainder[..end];
+        return parse_duration_string(duration_str);
     }
 
     None
 }
 
-/// Parse duration strings like "44s", "44.5s".
+/// Parse duration strings like "44s", "44.5s", "500ms".
 fn parse_duration_string(s: &str) -> Option<u64> {
     let s = s.trim();
-    if s.ends_with('s') {
-        let num_part = s.trim_end_matches('s');
-        if let Ok(secs) = num_part.parse::<f64>() {
+
+    // Handle milliseconds
+    if let Some(ms_part) = s.strip_suffix("ms") {
+        if let Ok(ms) = ms_part.parse::<f64>() {
+            // Convert to seconds, ensure at least 1 second if it's > 0 but < 1000ms
+            // to be safe with rate limiters, or return 0 if 0.
+            if ms <= 0.0 {
+                return Some(0);
+            }
+            let secs = (ms / 1000.0).ceil() as u64;
+            return Some(secs.max(1));
+        }
+    }
+
+    // Handle seconds
+    if let Some(s_part) = s.strip_suffix('s') {
+        if let Ok(secs) = s_part.parse::<f64>() {
             return Some(secs.ceil() as u64);
         }
     }
+
     None
 }
 

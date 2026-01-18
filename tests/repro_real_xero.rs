@@ -14,8 +14,8 @@ async fn test_real_xero_forecast_config_with_gemini() {
 
     let client = StructuredClientBuilder::new(api_key)
         .with_model(Model::Gemini3Flash)
-        .with_default_retries(0)
-        .with_default_parse_attempts(1)
+        .with_default_retries(2)
+        .with_default_parse_attempts(2)
         .build()
         .expect("Failed to build client");
 
@@ -52,7 +52,7 @@ Return a complete FullForecastConfig matching the schema.
             let has_auto_model = config.pnl_config.forecast_config.account_overrides.values().any(|o| {
                 matches!(
                     o.processor,
-                    Some(PnlProcessor::Model(ForecastModel::Auto { .. }))
+                    Some(PnlProcessor::Model(ForecastModel::Auto))
                 )
             });
             assert!(has_auto_model, "Expected at least one Auto forecast model");

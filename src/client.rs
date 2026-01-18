@@ -772,9 +772,12 @@ impl StructuredClient {
             }
         } else {
             if use_prompt_schema {
-                warn!(
+                info!(
                     schema.depth = schema_depth,
-                    "Schema depth exceeds strict-mode limit; falling back to prompt-embedded schema"
+                    schema.depth.limit = STRICT_SCHEMA_DEPTH_LIMIT,
+                    "Schema depth ({}) exceeds strict-mode limit ({}); using prompt-guided generation",
+                    schema_depth,
+                    STRICT_SCHEMA_DEPTH_LIMIT
                 );
                 let schema_instruction = format!(
                     "You must output valid JSON matching this schema exactly:\n{}",

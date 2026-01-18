@@ -111,7 +111,7 @@ where
             )));
         }
 
-        let mime_type = meta.mime_type.clone().unwrap();
+        let mime_type = meta.mime_type.clone().unwrap().to_string();
         let file_uri = meta.uri.as_ref().unwrap().to_string();
 
         let content = Content {
