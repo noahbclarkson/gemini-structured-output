@@ -16,8 +16,9 @@ use crate::{
     generator::TextGenerator,
     models::{RefinementAttempt, RefinementOutcome},
     schema::{
-        clean_schema_for_gemini, compile_validator, strip_x_fields, warn_if_schema_too_deep,
-        GeminiStructured, StructuredValidator,
+        clean_schema_for_gemini, coerce_enum_strings, compile_validator, prune_null_fields,
+        recover_internally_tagged_enums, strip_x_fields, unflatten_externally_tagged_enums,
+        warn_if_schema_too_deep, GeminiStructured, StructuredValidator,
     },
     StructuredClient,
 };
@@ -532,7 +533,8 @@ impl RefinementEngine {
                 continue;
             }
 
-            let candidate = next_value;
+            let mut candidate = next_value;
+            Self::normalize_candidate_for_schema(&mut candidate, &schema);
 
             if !validator.is_valid(&candidate) && !validator.is_valid(&candidate) {
                 let msg = validator
@@ -679,6 +681,13 @@ impl RefinementEngine {
                 .and_then(|a| a.error.clone())
                 .unwrap_or_else(|| "unknown error".to_string()),
         })
+    }
+
+    fn normalize_candidate_for_schema(candidate: &mut Value, schema: &Value) {
+        prune_null_fields(candidate);
+        unflatten_externally_tagged_enums(candidate, schema);
+        coerce_enum_strings(candidate, schema);
+        recover_internally_tagged_enums(candidate, schema);
     }
 
     fn apply_patches(&self, original: &Value, patch: &json_patch::Patch) -> (Value, Vec<String>) {
@@ -918,6 +927,7 @@ mod tests {
     use super::*;
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
 
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
     struct TestItem {
@@ -1056,5 +1066,43 @@ mod tests {
 
         // The second patch should still have been applied
         assert_eq!(result["items"][0]["name"], "Updated Item");
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+    #[serde(rename_all = "PascalCase")]
+    enum ForecastModel {
+        Auto,
+        Mstl {
+            #[serde(rename = "seasonalPeriods")]
+            seasonal_periods: Vec<usize>,
+        },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+    struct ModelWrapper {
+        model: ForecastModel,
+    }
+
+    #[test]
+    fn normalize_candidate_unflattens_external_enums() {
+        let schema = ModelWrapper::gemini_schema();
+        let mut candidate = json!({
+            "model": {
+                "type": "Mstl",
+                "seasonalPeriods": [12]
+            }
+        });
+
+        RefinementEngine::normalize_candidate_for_schema(&mut candidate, &schema);
+
+        let parsed: ModelWrapper = serde_json::from_value(candidate).unwrap();
+        assert_eq!(
+            parsed,
+            ModelWrapper {
+                model: ForecastModel::Mstl {
+                    seasonal_periods: vec![12]
+                }
+            }
+        );
     }
 }

@@ -303,6 +303,103 @@ pub fn recover_internally_tagged_enums(value: &mut Value, schema: &Value) {
     recover_internally_tagged_enums_with_root(value, schema, schema);
 }
 
+/// Recursively restructures JSON from Gemini's flat format ({"type": "Mstl", ...})
+/// to Serde's external tagging format ({"Mstl": {...}}).
+pub fn unflatten_externally_tagged_enums(value: &mut Value, schema: &Value) {
+    unflatten_with_root(value, schema, schema);
+}
+
+fn unflatten_with_root(value: &mut Value, schema: &Value, root: &Value) {
+    let schema = deref_schema(schema, root);
+
+    match value {
+        Value::Object(map) => {
+            if let Some(variants) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(|v| v.as_array())
+            {
+                if let Some((tag_key, tag_value)) = TAG_FIELD_NAMES
+                    .iter()
+                    .find_map(|&tag| map.get(tag).and_then(|v| v.as_str()).map(|s| (tag, s)))
+                {
+                    if let Some(variant_name) =
+                        find_matching_variant_name(variants, tag_value, root)
+                    {
+                        let mut content = std::mem::take(map);
+                        content.remove(tag_key);
+
+                        if content.is_empty() && is_unit_variant(variants, &variant_name, root) {
+                            *value = Value::String(variant_name);
+                            return;
+                        }
+
+                        let mut wrapper = Map::new();
+                        wrapper.insert(variant_name.clone(), Value::Object(content));
+                        *value = Value::Object(wrapper);
+
+                        if let Some(payload_schema) =
+                            find_variant_payload_schema(variants, &variant_name, root)
+                        {
+                            if let Value::Object(wrapper_map) = value {
+                                if let Some(inner) = wrapper_map.get_mut(&variant_name) {
+                                    unflatten_with_root(inner, payload_schema, root);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                let additional = schema.get("additionalProperties");
+                for (k, v) in map.iter_mut() {
+                    if let Some(sub_schema) = props.get(k) {
+                        unflatten_with_root(v, sub_schema, root);
+                    } else if let Some(additional) = additional {
+                        unflatten_with_root(v, additional, root);
+                    }
+                }
+                return;
+            }
+
+            if let Some(variants) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(|v| v.as_array())
+            {
+                if let Some(variant) = select_variant_for_object(map, variants) {
+                    unflatten_with_root(value, variant, root);
+                } else {
+                    for variant in variants {
+                        unflatten_with_root(value, variant, root);
+                    }
+                }
+            } else if let Some(additional) = schema.get("additionalProperties") {
+                for v in map.values_mut() {
+                    unflatten_with_root(v, additional, root);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            if let Some(items_schema) = schema.get("items") {
+                for item in arr {
+                    unflatten_with_root(item, items_schema, root);
+                }
+            } else if let Some(prefix_items) = schema.get("prefixItems").and_then(|v| v.as_array())
+            {
+                for (idx, item) in arr.iter_mut().enumerate() {
+                    if let Some(sub_schema) = prefix_items.get(idx) {
+                        unflatten_with_root(item, sub_schema, root);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn recover_internally_tagged_enums_with_root(value: &mut Value, schema: &Value, root: &Value) {
     let schema = deref_schema(schema, root);
 
@@ -641,6 +738,69 @@ fn select_variant_for_object<'a>(
     })
 }
 
+fn find_matching_variant_name(variants: &[Value], target: &str, root: &Value) -> Option<String> {
+    let target_norm = normalize_tag(target);
+
+    for variant in variants {
+        let variant = deref_schema(variant, root);
+        if let Some(props) = variant.get("properties").and_then(|v| v.as_object()) {
+            if props.len() == 1 {
+                let key = props.keys().next().expect("properties checked");
+                if normalize_tag(key) == target_norm {
+                    return Some(key.clone());
+                }
+            }
+        }
+
+        if let Some(enums) = variant.get("enum").and_then(|v| v.as_array()) {
+            for v in enums {
+                if let Some(s) = v.as_str() {
+                    if normalize_tag(s) == target_norm {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_variant_payload_schema<'a>(
+    variants: &'a [Value],
+    name: &str,
+    root: &'a Value,
+) -> Option<&'a Value> {
+    let target_norm = normalize_tag(name);
+
+    for variant in variants {
+        let variant = deref_schema(variant, root);
+        if let Some(props) = variant.get("properties").and_then(|v| v.as_object()) {
+            if props.len() == 1 {
+                let (key, schema) = props.iter().next().expect("properties checked");
+                if normalize_tag(key) == target_norm {
+                    return Some(schema);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_unit_variant(variants: &[Value], name: &str, root: &Value) -> bool {
+    let target_norm = normalize_tag(name);
+    for variant in variants {
+        let variant = deref_schema(variant, root);
+        if let Some(enums) = variant.get("enum").and_then(|v| v.as_array()) {
+            for v in enums {
+                if v.as_str().is_some_and(|s| normalize_tag(s) == target_norm) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn common_prefix_len(a: &str, b: &str) -> usize {
     a.chars()
         .zip(b.chars())
@@ -794,6 +954,91 @@ mod tests {
         recover_internally_tagged_enums(&mut value, &schema);
 
         assert_eq!(value, json!({"type": "auto"}));
+    }
+
+    #[test]
+    fn unflatten_externally_tagged_struct_variant() {
+        let schema = json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "Mstl": {
+                            "type": "object",
+                            "properties": {
+                                "seasonalPeriods": {
+                                    "type": "array",
+                                    "items": { "type": "integer" }
+                                }
+                            },
+                            "required": ["seasonalPeriods"]
+                        }
+                    },
+                    "required": ["Mstl"]
+                },
+                {
+                    "type": "string",
+                    "enum": ["Auto"]
+                }
+            ]
+        });
+
+        let mut value = json!({
+            "type": "Mstl",
+            "seasonalPeriods": [12]
+        });
+
+        unflatten_externally_tagged_enums(&mut value, &schema);
+
+        assert_eq!(
+            value,
+            json!({
+                "Mstl": {
+                    "seasonalPeriods": [12]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn unflatten_externally_tagged_unit_variant() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "model": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "Fixed": {
+                                    "type": "object",
+                                    "properties": {
+                                        "value": { "type": "number" }
+                                    },
+                                    "required": ["value"]
+                                }
+                            },
+                            "required": ["Fixed"]
+                        },
+                        {
+                            "type": "string",
+                            "enum": ["Auto"]
+                        }
+                    ]
+                }
+            },
+            "required": ["model"]
+        });
+
+        let mut value = json!({
+            "model": {
+                "type": "Auto"
+            }
+        });
+
+        unflatten_externally_tagged_enums(&mut value, &schema);
+
+        assert_eq!(value, json!({ "model": "Auto" }));
     }
 
     #[test]

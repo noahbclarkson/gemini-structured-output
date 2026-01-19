@@ -426,6 +426,9 @@ where
                         // Prune null fields to handle Gemini's occasional nulls for optional fields
                         crate::schema::prune_null_fields(&mut json_value);
 
+                        // Convert flat discriminator enums back to externally tagged format.
+                        crate::schema::unflatten_externally_tagged_enums(&mut json_value, &schema);
+
                         // Coerce enum strings when the model returns close-but-invalid values.
                         crate::schema::coerce_enum_strings(&mut json_value, &schema);
 
@@ -658,6 +661,9 @@ where
 
                 // Prune null fields to handle Gemini's occasional nulls for optional fields
                 crate::schema::prune_null_fields(&mut json_value);
+
+                // Convert flat discriminator enums back to externally tagged format.
+                crate::schema::unflatten_externally_tagged_enums(&mut json_value, &schema);
 
                 // Coerce enum strings when the model returns close-but-invalid values.
                 crate::schema::coerce_enum_strings(&mut json_value, &schema);
