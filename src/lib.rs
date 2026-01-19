@@ -57,7 +57,7 @@ pub mod workflow;
 pub use caching::CachePolicy;
 pub use caching::CacheSettings;
 pub use client::{
-    ClientConfig, FallbackStrategy, MockHandler, MockRequest, StructuredClient,
+    ClientConfig, FallbackStrategy, MockHandler, MockRequest, ResponseHook, StructuredClient,
     StructuredClientBuilder,
 };
 pub use context::ContextBuilder;
@@ -93,7 +93,8 @@ pub use workflow::{
 pub mod prelude {
     pub use crate::caching::{CachePolicy, CacheSettings};
     pub use crate::client::{
-        FallbackStrategy, MockHandler, MockRequest, StructuredClient, StructuredClientBuilder,
+        FallbackStrategy, MockHandler, MockRequest, ResponseHook, StructuredClient,
+        StructuredClientBuilder,
     };
     pub use crate::context::ContextBuilder;
     pub use crate::error::{Result, ResultExt, StructuredError};

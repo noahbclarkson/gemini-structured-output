@@ -30,6 +30,26 @@ use crate::{
 /// that can be deserialized into the target type.
 pub type MockHandler = Arc<dyn Fn(MockRequest) -> Result<String> + Send + Sync>;
 
+/// Hook that transforms JSON responses before deserialization.
+///
+/// This allows callers to fix common AI output issues (e.g., enum casing, field normalization)
+/// before the strict Rust deserializer runs. The hook receives a mutable reference to the
+/// parsed JSON value and can modify it in-place.
+///
+/// # Example
+/// ```rust,ignore
+/// use gemini_structured_output::prelude::*;
+/// use serde_json::Value;
+///
+/// let client = StructuredClientBuilder::new("api-key")
+///     .with_response_hook(|val: &mut Value| {
+///         // Fix common enum casing issues
+///         fix_enum_casing(val);
+///     })
+///     .build()?;
+/// ```
+pub type ResponseHook = Arc<dyn Fn(&mut serde_json::Value) + Send + Sync>;
+
 /// Minimal view of a structured request passed to [`MockHandler`].
 #[derive(Debug, Clone)]
 pub struct MockRequest {
@@ -116,6 +136,7 @@ pub struct StructuredClientBuilder {
     config: ClientConfig,
     mock_handler: Option<MockHandler>,
     refinement_engine_override: Option<RefinementEngine>,
+    response_hook: Option<ResponseHook>,
 }
 
 impl StructuredClientBuilder {
@@ -132,6 +153,7 @@ impl StructuredClientBuilder {
             config: ClientConfig::default(),
             mock_handler: None,
             refinement_engine_override: None,
+            response_hook: None,
         }
     }
 
@@ -254,6 +276,31 @@ impl StructuredClientBuilder {
         self
     }
 
+    /// Set a response hook to transform JSON before deserialization.
+    ///
+    /// The hook receives a mutable reference to the parsed JSON value and can modify it
+    /// in-place. This is useful for fixing common AI output issues such as:
+    /// - Enum casing (e.g., "Drawing" -> "drawing")
+    /// - Field normalization
+    /// - Removing unexpected fields
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let client = StructuredClientBuilder::new("api-key")
+    ///     .with_response_hook(|val: &mut serde_json::Value| {
+    ///         // Recursively fix enum casing issues
+    ///         fix_common_casing_issues(val);
+    ///     })
+    ///     .build()?;
+    /// ```
+    pub fn with_response_hook(
+        mut self,
+        hook: impl Fn(&mut serde_json::Value) + Send + Sync + 'static,
+    ) -> Self {
+        self.response_hook = Some(Arc::new(hook));
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<StructuredClient> {
         let client = Arc::new(Gemini::with_model(&self.api_key, self.model.clone())?);
@@ -293,6 +340,7 @@ impl StructuredClientBuilder {
             cache: SchemaCache::new(client.clone(), self.cache_policy),
             config: self.config,
             mock_handler: self.mock_handler,
+            response_hook: self.response_hook,
         })
     }
 }
@@ -308,6 +356,7 @@ pub struct StructuredClient {
     cache: SchemaCache,
     config: ClientConfig,
     pub(crate) mock_handler: Option<MockHandler>,
+    pub(crate) response_hook: Option<ResponseHook>,
 }
 
 impl StructuredClient {
@@ -462,6 +511,11 @@ impl StructuredClient {
     /// Access the internal refinement engine.
     pub(crate) fn refiner(&self) -> &RefinementEngine {
         &self.refiner
+    }
+
+    /// Access the response hook (if configured).
+    pub(crate) fn response_hook(&self) -> Option<&ResponseHook> {
+        self.response_hook.as_ref()
     }
 
     /// Select the appropriate client based on the fallback strategy and attempt count.

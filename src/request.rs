@@ -17,7 +17,7 @@ use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     caching::CacheSettings,
-    client::{BuilderOptions, MockRequest},
+    client::{BuilderOptions, MockRequest, ResponseHook},
     error::StructuredError,
     models::GenerationOutcome,
     schema::{compile_validator, GeminiStructured},
@@ -435,6 +435,11 @@ where
                         // Recover internally-tagged enums that Gemini collapsed to strings
                         crate::schema::recover_internally_tagged_enums(&mut json_value, &schema);
 
+                        // Apply user-provided response hook for custom transformations
+                        if let Some(hook) = self.client.response_hook() {
+                            hook(&mut json_value);
+                        }
+
                         match serde_json::from_value::<T>(json_value) {
                             Ok(parsed) => {
                                 debug!("Successfully parsed structured response");
@@ -608,6 +613,7 @@ where
             response_id: Option<String>,
             function_calls: Vec<gemini_rust::tools::FunctionCall>,
             refinement_instruction: Option<String>,
+            response_hook: Option<ResponseHook>,
             _marker: PhantomData<T>,
         }
 
@@ -619,6 +625,7 @@ where
             response_id: None,
             function_calls: Vec::new(),
             refinement_instruction: self.refinement_instruction.clone(),
+            response_hook: self.client.response_hook().cloned(),
             _marker: PhantomData,
         };
 
@@ -670,6 +677,11 @@ where
 
                 // Recover internally-tagged enums that Gemini collapsed to strings
                 crate::schema::recover_internally_tagged_enums(&mut json_value, &schema);
+
+                // Apply user-provided response hook for custom transformations
+                if let Some(hook) = &state.response_hook {
+                    hook(&mut json_value);
+                }
 
                 let parsed: T = serde_json::from_value(json_value)
                     .map_err(|e| StructuredError::parse_error(e, &cleaned))?;
