@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use gemini_rust::{
     generation::builder::ContentBuilder, generation::model::UsageMetadata, tools::FunctionCall,
@@ -704,6 +705,11 @@ impl StructuredClient {
             ));
         }
 
+        let start_time = Instant::now();
+        let target_type = std::any::type_name::<T>();
+
+        debug!(target: "gemini_structured", %target_type, "Starting structured request execution");
+
         let builder = self
             .configured_builder::<T>(
                 &contents,
@@ -719,6 +725,36 @@ impl StructuredClient {
             .await?;
 
         let response = builder.execute().await?;
+        let duration = start_time.elapsed();
+
+        // Log result details
+        if let Some(usage) = &response.usage_metadata {
+            let prompt = usage.prompt_token_count.unwrap_or(0);
+            let candidates = usage.candidates_token_count.unwrap_or(0);
+            let total = usage.total_token_count.unwrap_or(0);
+
+            // Log at INFO if it took > 10s or tokens are high, otherwise DEBUG
+            if duration.as_secs() > 10 || total > 50000 {
+                info!(
+                    target: "gemini_structured",
+                    %target_type,
+                    duration_ms = duration.as_millis(),
+                    tokens.total = total,
+                    tokens.prompt = prompt,
+                    tokens.completion = candidates,
+                    "Long-running request completed"
+                );
+            } else {
+                debug!(
+                    target: "gemini_structured",
+                    %target_type,
+                    duration_ms = duration.as_millis(),
+                    tokens.total = total,
+                    "Request completed"
+                );
+            }
+        }
+
         let text = response.text();
         let parsed: T = serde_json::from_str(&text)?;
 

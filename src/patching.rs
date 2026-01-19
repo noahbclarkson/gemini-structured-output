@@ -335,6 +335,9 @@ impl RefinementEngine {
     where
         T: GeminiStructured + StructuredValidator + Serialize + DeserializeOwned + Clone,
     {
+        let start_total = std::time::Instant::now();
+        info!(target: "gemini_refine", "Starting refinement loop");
+
         let schema = T::gemini_schema();
         let validator = compile_validator::<T>()?;
         let mut working = serde_json::to_value(&current)?;
@@ -356,6 +359,7 @@ impl RefinementEngine {
         );
 
         for attempt_idx in 1..=self.config.max_retries {
+            let attempt_start = std::time::Instant::now();
             let previous_valid = working.clone();
             let current_struct: T = serde_json::from_value(working.clone())?;
             let dynamic_context = context_generator
@@ -476,6 +480,14 @@ impl RefinementEngine {
                 patch_text
             };
 
+            // Log attempt timing
+            debug!(
+                target: "gemini_refine",
+                attempt = attempt_idx,
+                duration_ms = attempt_start.elapsed().as_millis(),
+                "Refinement iteration generated"
+            );
+
             let cleaned_patch = clean_patch_text(&patch_text);
             let patch_result: PatchResult = match serde_json::from_str(cleaned_patch) {
                 Ok(p) => p,
@@ -513,12 +525,13 @@ impl RefinementEngine {
             let (next_value, patch_errors) = self.apply_patches(&working, &patch);
 
             if !patch_errors.is_empty() {
+                // Log detailed patch errors to help debug invalid models
                 let msg = patch_errors.join("; ");
                 warn!(
+                    target: "gemini_refine",
                     attempt = attempt_idx,
-                    errors = %msg,
-                    patch_text = %patch_text,
-                    "Patch application had failures"
+                    errors = ?patch_errors,
+                    "Patch application failed"
                 );
                 attempts.push(RefinementAttempt::failure(patch_text.clone(), msg.clone()));
                 conversation.push(Message::user(format!(
@@ -667,6 +680,12 @@ impl RefinementEngine {
             debug!("Refinement successful on attempt {}", attempt_idx);
             attempts.push(RefinementAttempt::success(patch_text));
             let applied_patch = patch.clone();
+            info!(
+                target: "gemini_refine",
+                total_duration_ms = start_total.elapsed().as_millis(),
+                attempts = attempt_idx,
+                "Refinement successful"
+            );
             return Ok(RefinementOutcome::with_patch(
                 value,
                 attempts,
@@ -733,8 +752,11 @@ impl RefinementEngine {
     fn build_system_prompt(&self) -> String {
         let base = "You are a JSON Patch generator. Given the current JSON value and the target schema, \
                     return a JSON object with a 'patch' key containing an array of valid RFC6902 \
-                    operations that transforms the current value to satisfy the instruction and schema. \
-                    Do not wrap in code fences or prose.";
+                    operations that transforms the current value to satisfy the instruction and schema.\n\n\
+                    CRITICAL RULES:\n\
+                    1. Do not wrap output in code fences (```json).\n\
+                    2. For 'add' and 'replace' operations, the 'value' field is MANDATORY. Do not omit it.\n\
+                    3. Ensure paths are valid JSON Pointers (start with /).";
 
         let array_guidance = match self.config.array_strategy {
             ArrayPatchStrategy::ReplaceWhole => {
